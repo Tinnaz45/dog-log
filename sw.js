@@ -1,4 +1,4 @@
-const CACHE = 'dog-log-v4';
+const CACHE = 'dog-log-v5';
 const ASSETS = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', e => {
