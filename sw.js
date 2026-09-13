@@ -1,4 +1,4 @@
-const CACHE = 'freezerstock-v1';
+const CACHE = 'dog-food-stock-v2';
 const ASSETS = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', e => {
