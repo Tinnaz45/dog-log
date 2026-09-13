@@ -1,7 +1,7 @@
 {
-  "name": "Dog Food Stock",
-  "short_name": "Dog Food",
-  "description": "Dog food inventory, run-out forecasting and order planning",
+  "name": "Dog Log",
+  "short_name": "Dog Log",
+  "description": "Dog management and tracking, starting with food inventory and planning",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0d1f1a",
