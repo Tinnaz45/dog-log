@@ -1,7 +1,7 @@
 {
-  "name": "FreezerStock",
-  "short_name": "FreezerStock",
-  "description": "Dog food freezer inventory tracker",
+  "name": "Dog Food Stock",
+  "short_name": "Dog Food",
+  "description": "Dog food inventory, run-out forecasting and order planning",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0d1f1a",
