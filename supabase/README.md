@@ -27,7 +27,7 @@ This folder holds the Dog Log cloud-sync database: the `dog_log` schema in the s
 - Clients need only three things: the project URL, the **publishable** key and an authenticated email/password session. They never need a service-role key.
 - `anon` has no schema usage and no privileges.
 - `authenticated` has only `SELECT` on the four tables, restricted by RLS to `owner_id = auth.uid()`. No client role has `INSERT`, `UPDATE` or `DELETE`, so every write goes through the two RPCs.
-- The RPCs are `SECURITY DEFINER` with `search_path = ''`. They take the owner only from `auth.uid()` and never from a parameter, and they refuse to run without a JWT subject.
+- The RPCs are `SECURITY DEFINER`. Every function pins `search_path = pg_catalog, pg_temp`, with `pg_temp` explicitly last so a caller's temporary objects cannot shadow type names. They take the owner only from `auth.uid()` and never from a parameter, and they refuse to run without a JWT subject.
 - Privileges are revoked explicitly on every object, not only through default privileges. PostgreSQL grants `EXECUTE` on new functions to `PUBLIC`, and Supabase's "automatically expose new tables" setting can add grants. The local test stub installs hostile global defaults to prove the revokes still hold.
 - The calendar pairing token, `paired`, `lastSync` and `lastError` are stripped server-side. They stay on the device.
 
