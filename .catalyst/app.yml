@@ -1,0 +1,27 @@
+# Catalyst App Manifest — identity and routing metadata only.
+# Answers "What am I?". Cross-app relationships live in fleet/FLEET_REGISTRY.yml.
+# Irrelevant fields are omitted rather than carrying filler (CORE_RULES.md section 13.1).
+# Hosting, runtime, lifecycle and database facts are deliberately undeclared: they were
+# not evidenced during GOV-442 and are not inferred here.
+
+schema: catalyst/app@1
+
+id: dog-log
+name: Dog Log
+repository: Tinnaz45/dog-log
+
+# The declared branch model (CORE_RULES.md section 8.1.1 / 8.10). `main` is the sole
+# long-lived branch and is Production. No `dev` branch exists or is to be created.
+branches:
+  model: main-only
+  production: main
+  reason: >-
+    Dog Log has a single Production Vercel deployment fed by main and no independent
+    DEV runtime or verification boundary, so an integration branch would gate nothing.
+    Every change lands via a task branch and pull request into main, and each pull
+    request requires explicit operator approval for that specific pull request before
+    it is merged.
+
+linear:
+  team: Workshop
+  app_label: Dog Log
