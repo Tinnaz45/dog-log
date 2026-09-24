@@ -17,7 +17,9 @@
 --   * Privileges are revoked explicitly per object (R3), not only through default
 --     privileges, because PostgreSQL grants EXECUTE on new functions to PUBLIC and
 --     Supabase "auto expose" can add anon/authenticated grants.
---   * SECURITY DEFINER functions pin `search_path = ''` and qualify every name.
+--   * Every function pins `search_path = pg_catalog, pg_temp` (pg_temp explicitly
+--     last, so a caller's temporary objects can never shadow a type or relation
+--     name) and qualifies every dog_log/auth name.
 --
 -- Applying this file is a separate, separately approved act
 -- (ENVIRONMENT_LIFECYCLE 10): DEV first, PROD only with explicit approval for this
@@ -32,7 +34,11 @@ comment on schema dog_log is 'Dog Log cloud sync (WORK-136). Writes only through
 revoke all on schema dog_log from public;
 grant usage on schema dog_log to authenticated;
 
--- Second layer only; every object below is also revoked explicitly.
+-- Convention from CORE_RULES 12.1.3. Note: schema-level default privileges can only
+-- remove grants that were themselves added at schema level; they do not cancel
+-- global defaults or PostgreSQL's implicit PUBLIC EXECUTE. The protection that
+-- actually holds is the explicit per-object REVOKE after every object below, and any
+-- later dog_log migration must repeat it.
 alter default privileges in schema dog_log revoke all on tables from public, anon, authenticated;
 alter default privileges in schema dog_log revoke all on sequences from public, anon, authenticated;
 alter default privileges in schema dog_log revoke execute on functions from public, anon, authenticated;
@@ -130,45 +136,46 @@ create policy state_snapshots_select_own on dog_log.state_snapshots
 
 -- Lenient number conversion mirroring the client's Number(x)||0 (R10): never raises.
 create function dog_log._num(p jsonb, p_default numeric default 0)
-returns numeric language plpgsql immutable set search_path = '' as $$
+returns numeric language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
 begin
   if p is null or jsonb_typeof(p) = 'null' then return p_default; end if;
-  if jsonb_typeof(p) = 'number' then return (p #>> '{}')::numeric; end if;
-  if jsonb_typeof(p) = 'string' and (p #>> '{}') ~ '^\s*-?(\d+\.?\d*|\.\d+)\s*$' then
-    return trim(p #>> '{}')::numeric;
+  -- Values are bounded to +/-1e9 so no later arithmetic can overflow.
+  if jsonb_typeof(p) = 'number' then return least(greatest((p #>> '{}')::numeric, -1000000000), 1000000000); end if;
+  if jsonb_typeof(p) = 'string' and length(p #>> '{}') <= 40 and (p #>> '{}') ~ '^\s*-?(\d+\.?\d*|\.\d+)\s*$' then
+    return least(greatest(trim(p #>> '{}')::numeric, -1000000000), 1000000000);
   end if;
   return 0;
 end $$;
 
 create function dog_log._count(p numeric)
-returns numeric language sql immutable set search_path = '' as $$
-  select round(greatest(coalesce(p, 0), 0))
+returns numeric language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select round(least(greatest(coalesce(p, 0), 0), 1000000))
 $$;
 
 create function dog_log._kg(p numeric)
-returns numeric language sql immutable set search_path = '' as $$
-  select round(greatest(coalesce(p, 0), 0), 3)
+returns numeric language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select round(least(greatest(coalesce(p, 0), 0), 1000000), 3)
 $$;
 
 create function dog_log._is_count_key(p_key text)
-returns boolean language sql immutable set search_path = '' as $$
+returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$
   select coalesce(p_key in ('fridge', 'freezer', 'neckPackets', 'necksOnly', 'minceOnly', 'lykaPackets', 'scratchPackets'), false)
 $$;
 
 create function dog_log._is_stock_key(p_key text)
-returns boolean language sql immutable set search_path = '' as $$
+returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$
   select coalesce(p_key = 'minceKg', false) or dog_log._is_count_key(p_key)
 $$;
 
 -- Normalise a stock value for storage/comparison (R7): counts are integers, kg 3 dp.
 create function dog_log._stock_val(p_key text, p numeric)
-returns numeric language sql immutable set search_path = '' as $$
+returns numeric language sql immutable set search_path = pg_catalog, pg_temp as $$
   select case when p_key = 'minceKg' then dog_log._kg(p) else dog_log._count(p) end
 $$;
 
 -- Safe timestamptz parse; null on failure.
 create function dog_log._try_ts(p text)
-returns timestamptz language plpgsql stable set search_path = '' as $$
+returns timestamptz language plpgsql stable set search_path = pg_catalog, pg_temp as $$
 begin
   return p::timestamptz;
 exception when others then
@@ -177,26 +184,28 @@ end $$;
 
 -- JS Date.prototype.toISOString() format.
 create function dog_log._iso(p timestamptz)
-returns text language sql stable set search_path = '' as $$
+returns text language sql stable set search_path = pg_catalog, pg_temp as $$
   select to_char(p at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
 $$;
 
 create function dog_log._slot_at(p_date date, p_slot text, p_tz text)
-returns timestamptz language sql stable set search_path = '' as $$
+returns timestamptz language sql stable set search_path = pg_catalog, pg_temp as $$
   select (p_date + case p_slot when 'breakfast' then time '09:00' else time '18:00' end) at time zone p_tz
 $$;
 
--- en-AU short day as the client's fmtShortDay(): 'Thu 24 Sep', plus ' 2025' when not the current year.
+-- en-AU short day as the client's fmtShortDay() (Intl en-AU day+month short: June, July, Sept),
+-- e.g. 'Thu 24 Sept', plus ' 2025' when not the current year.
 create function dog_log._fmt_day(p timestamptz, p_tz text)
-returns text language sql stable set search_path = '' as $$
-  select to_char(p at time zone p_tz, 'Dy FMDD Mon')
+returns text language sql stable set search_path = pg_catalog, pg_temp as $$
+  select to_char(p at time zone p_tz, 'Dy FMDD ')
+      || (array['Jan','Feb','Mar','Apr','May','June','July','Aug','Sept','Oct','Nov','Dec'])[extract(month from p at time zone p_tz)::int]
       || case when extract(year from p at time zone p_tz) <> extract(year from now() at time zone p_tz)
               then ' ' || extract(year from p at time zone p_tz)::int::text else '' end
 $$;
 
 -- Prepend a history entry {at, action}; keep the newest 150 (client log()).
 create function dog_log._history_push(p_doc jsonb, p_at timestamptz, p_action text)
-returns jsonb language sql stable set search_path = '' as $$
+returns jsonb language sql stable set search_path = pg_catalog, pg_temp as $$
   select jsonb_set(p_doc, '{history}',
     (select coalesce(jsonb_agg(e order by ord), '[]'::jsonb)
        from (select e, ord from (
@@ -209,7 +218,7 @@ $$;
 -- Convert (never reject) a client doc into the canonical server shape (R10).
 -- Strips every device-local calendar credential/status field (section 15).
 create function dog_log._norm_doc(p jsonb)
-returns jsonb language plpgsql stable set search_path = '' as $$
+returns jsonb language plpgsql stable set search_path = pg_catalog, pg_temp as $$
 declare
   s        jsonb := case when jsonb_typeof(p -> 'stock') = 'object' then p -> 'stock' else '{}'::jsonb end;
   st       jsonb := case when jsonb_typeof(p -> 'settings') = 'object' then p -> 'settings' else '{}'::jsonb end;
@@ -222,7 +231,7 @@ declare
   endpoint text;
 begin
   select coalesce(jsonb_agg(jsonb_build_object(
-           'at',              case when jsonb_typeof(b -> 'at') = 'string' then b ->> 'at' else null end,
+           'at',              case when jsonb_typeof(b -> 'at') = 'string' then left(b ->> 'at', 40) else null end,
            'containers',      dog_log._kg(dog_log._num(b -> 'containers')),
            'minceUsedKg',     dog_log._kg(dog_log._num(b -> 'minceUsedKg')),
            'neckPacketsUsed', dog_log._kg(dog_log._num(b -> 'neckPacketsUsed')),
@@ -235,7 +244,7 @@ begin
            where jsonb_typeof(b) = 'object' order by ord limit 50) x;
 
   select coalesce(jsonb_agg(jsonb_build_object(
-           'at',     case when jsonb_typeof(h -> 'at') = 'string' then h ->> 'at' else null end,
+           'at',     case when jsonb_typeof(h -> 'at') = 'string' then left(h ->> 'at', 40) else null end,
            'action', left(h ->> 'action', 500)
          ) order by ord), '[]'::jsonb)
     into history
@@ -245,8 +254,11 @@ begin
 
   inc := dog_log._kg(dog_log._num(st -> 'mincePurchaseIncrementKg', 0.5));
   if inc = 0 then inc := 0.5; end if;          -- client: Number(x)||.5
-  inc := greatest(0.1, inc);                   -- client: Math.max(.1, ...)
-  endpoint := case when jsonb_typeof(cal -> 'endpoint') = 'string' then left(cal ->> 'endpoint', 500) else '' end;
+  inc := least(greatest(0.1, inc), 1000);      -- client: Math.max(.1, ...); bounded
+  endpoint := case when jsonb_typeof(cal -> 'endpoint') = 'string'
+                     and (cal ->> 'endpoint') ~ '^https://script\.google\.com/macros/s/[^/\s]+/exec$'
+                     and length(cal ->> 'endpoint') <= 500
+                   then cal ->> 'endpoint' else '' end;
 
   return jsonb_build_object(
     'stock', jsonb_build_object(
@@ -259,21 +271,21 @@ begin
       'lykaPackets',    dog_log._count(dog_log._num(s -> 'lykaPackets')),
       'scratchPackets', dog_log._count(dog_log._num(s -> 'scratchPackets'))),
     'settings', jsonb_build_object(
-      'totalContainers',          round(greatest(dog_log._num(st -> 'totalContainers', 40), 0), 2),
+      'totalContainers',          round(least(greatest(dog_log._num(st -> 'totalContainers', 40), 0), 1000000), 2),
       'mincePurchaseIncrementKg', inc),
     'batches',  batches,
     'history',  history,
     'calendar', jsonb_build_object('endpoint', endpoint),
     'legacy',   jsonb_build_object(
-      'containersPerDay', coalesce(st -> 'containersPerDay', '2'::jsonb),
-      'lastAutoDate',     coalesce(tr -> 'lastAutoDate', 'null'::jsonb)));
+      'containersPerDay', case when jsonb_typeof(st -> 'containersPerDay') = 'number' then to_jsonb(dog_log._num(st -> 'containersPerDay')) else '2'::jsonb end,
+      'lastAutoDate',     case when jsonb_typeof(tr -> 'lastAutoDate') = 'string' then to_jsonb(left(tr ->> 'lastAutoDate', 40)) else 'null'::jsonb end));
 end $$;
 
 -- Section 7: exactly-once scheduled meals. Caller holds the state row lock.
 -- Processes every slot in (meal_cursor, p_until]; deduction happens only when the
 -- meal_events primary-key insert succeeds. Returns true when anything changed.
 create function dog_log._process_due_meals(p_owner uuid, p_until timestamptz, p_device text)
-returns boolean language plpgsql volatile set search_path = '' as $$
+returns boolean language plpgsql volatile set search_path = pg_catalog, pg_temp as $$
 declare
   r         dog_log.state%rowtype;
   v_doc     jsonb;
@@ -323,6 +335,9 @@ begin
   end if;
 
   if p_until <= v_cursor then return false; end if;
+  -- Bound the catch-up walk (at most ~800 slots) so a corrupt or ancient cursor can
+  -- never make every sync time out; older slots are beyond meal_events retention anyway.
+  v_cursor := greatest(v_cursor, p_until - interval '400 days');
 
   for v_day in select d::date from generate_series((v_cursor at time zone v_tz)::date, (p_until at time zone v_tz)::date, interval '1 day') d loop
     foreach v_slot in array array['breakfast', 'dinner'] loop
@@ -381,7 +396,7 @@ end $$;
 -- Section 8: apply one validated operation to the locked state row.
 -- Returns {status, detail}. Never overwrites a stale value silently.
 create function dog_log._apply_op(p_owner uuid, p_op jsonb, p_cc timestamptz, p_start_revision bigint)
-returns jsonb language plpgsql volatile set search_path = '' as $$
+returns jsonb language plpgsql volatile set search_path = pg_catalog, pg_temp as $$
 declare
   r          dog_log.state%rowtype;
   v_doc      jsonb;
@@ -412,6 +427,9 @@ begin
       return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid adjust'));
     end if;
     v_delta := (p_op ->> 'delta')::numeric;
+    if abs(v_delta) > 1000000 then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'delta out of range'));
+    end if;
     if dog_log._is_count_key(v_key) and v_delta <> round(v_delta) then
       return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'count delta must be an integer'));
     end if;
@@ -574,7 +592,7 @@ begin
 end $$;
 
 create function dog_log._state_json(p_owner uuid)
-returns jsonb language sql stable set search_path = '' as $$
+returns jsonb language sql stable set search_path = pg_catalog, pg_temp as $$
   select jsonb_build_object(
     'revision', s.revision,
     'schema_version', s.schema_version,
@@ -604,7 +622,7 @@ $$;
 -- Section 6/10: first-device seed. Creates the cloud state only if none exists.
 create function dog_log.seed_state(p_seed_id uuid, p_doc jsonb, p_device_id text default null, p_client_version integer default 1)
 returns jsonb language plpgsql volatile security definer
-set search_path = '' set lock_timeout = '3s' as $$
+set search_path = pg_catalog, pg_temp set lock_timeout = '3s' as $$
 declare
   v_owner    uuid := (select auth.uid());
   v_device   text := left(p_device_id, 100);
@@ -622,13 +640,17 @@ begin
   if v_owner is null then
     raise exception 'not_authenticated' using errcode = '42501';
   end if;
+  if coalesce(p_client_version, 0) < 1 then
+    raise exception 'client_outdated' using errcode = '22023', hint = 'min_client_version=1';
+  end if;
   if p_seed_id is null or p_doc is null or jsonb_typeof(p_doc) <> 'object' then
     raise exception 'invalid_seed' using errcode = '22023';
   end if;
 
   v_doc := dog_log._norm_doc(p_doc);
   v_ms := case when jsonb_typeof(p_doc #> '{tracking,mealCursor}') = 'number' then (p_doc #>> '{tracking,mealCursor}')::numeric end;
-  v_cursor := case when v_ms is not null then least(now(), to_timestamp(v_ms / 1000.0)) end;
+  v_cursor := case when v_ms is not null and v_ms between -8.64e15 and 8.64e15
+                   then greatest(least(now(), to_timestamp(v_ms / 1000.0)), now() - interval '400 days') end;
   v_since := case when v_cursor is not null then coalesce(dog_log._try_ts(p_doc #>> '{tracking,mealTrackingSince}'), v_cursor) end;
 
   insert into dog_log.state (owner_id, doc, seed_id, seeded_from_device, meal_cursor, meal_tracking_since, updated_by_device)
@@ -676,7 +698,7 @@ end $$;
 -- revision once only if anything changed, and returns the fresh state.
 create function dog_log.sync(p_mutations jsonb default '[]'::jsonb, p_device_id text default null, p_client_version integer default 1)
 returns jsonb language plpgsql volatile security definer
-set search_path = '' set lock_timeout = '3s' as $$
+set search_path = pg_catalog, pg_temp set lock_timeout = '3s' as $$
 declare
   v_owner    uuid := (select auth.uid());
   v_device   text := left(p_device_id, 100);
@@ -688,6 +710,7 @@ declare
   v_prior    dog_log.mutations%rowtype;
   v_res      jsonb;
   v_results  jsonb := '[]'::jsonb;
+  v_ord      bigint;
   v_cursor   timestamptz;
   v_revision bigint;
 begin
@@ -711,7 +734,10 @@ begin
       hint = 'min_client_version=' || r0.min_client_version;
   end if;
 
-  for v_m in select e from jsonb_array_elements(p_mutations) e loop
+  -- Section 7/R1: ops are applied in the order the user made them (client_created_at),
+  -- ties and unparsable times in submitted order.
+  for v_m, v_ord in select e, ord from jsonb_array_elements(p_mutations) with ordinality as t(e, ord)
+              order by dog_log._try_ts(case when jsonb_typeof(e) = 'object' then e ->> 'client_created_at' end) nulls last, ord loop
     v_id := null;
     begin
       v_id := (v_m ->> 'mutation_id')::uuid;
@@ -719,14 +745,14 @@ begin
       v_id := null;
     end;
     if v_id is null or jsonb_typeof(v_m) <> 'object' then
-      v_results := v_results || jsonb_build_object('mutation_id', v_m -> 'mutation_id', 'status', 'rejected',
+      v_results := v_results || jsonb_build_object('_ord', v_ord, 'mutation_id', v_m -> 'mutation_id', 'status', 'rejected',
                                                    'detail', jsonb_build_object('reason', 'invalid mutation_id'));
       continue;
     end if;
 
     select * into v_prior from dog_log.mutations where owner_id = v_owner and mutation_id = v_id;
     if found then
-      v_results := v_results || jsonb_build_object('mutation_id', v_id, 'status', 'duplicate',
+      v_results := v_results || jsonb_build_object('_ord', v_ord, 'mutation_id', v_id, 'status', 'duplicate',
         'original_status', v_prior.status, 'detail', v_prior.detail, 'result_revision', v_prior.result_revision);
       continue;
     end if;
@@ -745,15 +771,18 @@ begin
       exception
         when lock_not_available or query_canceled then raise;   -- retryable: propagate to the client
         when others then
-          v_res := jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid operation', 'error', sqlerrm));
+          v_res := jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid operation', 'sqlstate', sqlstate));
       end;
     end if;
 
     insert into dog_log.mutations (owner_id, mutation_id, device_id, op_type, client_created_at, status, detail)
     values (v_owner, v_id, coalesce(left(v_m ->> 'device_id', 100), v_device), left(v_m ->> 'type', 50), v_cc,
             v_res ->> 'status', v_res -> 'detail');
-    v_results := v_results || (jsonb_build_object('mutation_id', v_id) || v_res);
+    v_results := v_results || (jsonb_build_object('_ord', v_ord, 'mutation_id', v_id) || v_res);
   end loop;
+  -- Results are returned in submitted order, whatever order the ops were applied in.
+  select coalesce(jsonb_agg(x - '_ord' order by (x ->> '_ord')::bigint), '[]'::jsonb) into v_results
+    from jsonb_array_elements(v_results) x;
 
   perform dog_log._process_due_meals(v_owner, now(), v_device);
 

@@ -30,12 +30,17 @@ end $$;
 \set asB 'set local role authenticated; select set_config(''request.jwt.claims'', ''{"sub":"bbbbbbbb-0000-4000-8000-00000000000b","role":"authenticated"}'', true) \\g /dev/null'
 \set asD 'set local role authenticated; select set_config(''request.jwt.claims'', ''{"sub":"dddddddd-0000-4000-8000-00000000000d","role":"authenticated"}'', true) \\g /dev/null'
 \set asE 'set local role authenticated; select set_config(''request.jwt.claims'', ''{"sub":"eeeeeeee-0000-4000-8000-00000000000e","role":"authenticated"}'', true) \\g /dev/null'
+\set F '''ffffffff-0000-4000-8000-00000000000f'''
+\set G '''99999999-0000-4000-8000-000000000009'''
+\set asF 'set local role authenticated; select set_config(''request.jwt.claims'', ''{"sub":"ffffffff-0000-4000-8000-00000000000f","role":"authenticated"}'', true) \\g /dev/null'
+\set asG 'set local role authenticated; select set_config(''request.jwt.claims'', ''{"sub":"99999999-0000-4000-8000-000000000009","role":"authenticated"}'', true) \\g /dev/null'
 \set asNoJwt 'set local role authenticated; select set_config(''request.jwt.claims'', '''', true) \\g /dev/null'
 \set asAnon 'set local role anon; select set_config(''request.jwt.claims'', ''{"role":"anon"}'', true) \\g /dev/null'
 \set asOwner 'reset role; select set_config(''request.jwt.claims'', '''', true) \\g /dev/null'
 
 insert into auth.users (id, email) values
-  (:A, 'a@test.invalid'), (:B, 'b@test.invalid'), (:D, 'd@test.invalid'), (:E, 'e@test.invalid');
+  (:A, 'a@test.invalid'), (:B, 'b@test.invalid'), (:D, 'd@test.invalid'), (:E, 'e@test.invalid'),
+  (:F, 'f@test.invalid'), (:G, 'g@test.invalid');
 
 -- ---------------------------------------------------------------- 1. install
 select pg_temp.ok((select count(*) from pg_tables where schemaname = 'dog_log') = 4, '01 four dog_log tables exist');
@@ -45,7 +50,7 @@ select pg_temp.ok(to_regprocedure('dog_log.seed_state(uuid,jsonb,text,integer)')
 select pg_temp.ok((select prosecdef from pg_proc where oid = 'dog_log.sync(jsonb,text,integer)'::regprocedure)
               and (select prosecdef from pg_proc where oid = 'dog_log.seed_state(uuid,jsonb,text,integer)'::regprocedure), '01 client RPCs are SECURITY DEFINER');
 select pg_temp.ok(not exists (select 1 from pg_proc where pronamespace = 'dog_log'::regnamespace
-                                 and not coalesce(proconfig @> array['search_path=""'], false)), '01 every dog_log function pins search_path=''''');
+                                 and not coalesce(proconfig @> array['search_path=pg_catalog, pg_temp'], false)), '01 every dog_log function pins search_path=pg_catalog, pg_temp');
 select pg_temp.ok(exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'dog_log' and tablename = 'state')
               and (select count(*) from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'dog_log') = 1, '01 only dog_log.state added to supabase_realtime');
 
@@ -427,6 +432,69 @@ do $$ begin
 exception when invalid_parameter_value then raise notice 'ok   22 more than 50 mutations per call refused';
 end $$;
 :asOwner
+
+-- ------------------------------------------ 23. hardening (independent review)
+select pg_temp.ok(dog_log._fmt_day(timestamptz '2025-09-24 12:00 Australia/Melbourne', 'Australia/Melbourne') = 'Wed 24 Sept 2025'
+              and dog_log._fmt_day(timestamptz '2025-06-03 12:00 Australia/Melbourne', 'Australia/Melbourne') = 'Tue 3 June 2025'
+              and dog_log._fmt_day(timestamptz '2025-07-03 12:00 Australia/Melbourne', 'Australia/Melbourne') = 'Thu 3 July 2025',
+                  '23 day labels use en-AU Intl month names (June, July, Sept)');
+:asF
+select dog_log.seed_state(gen_random_uuid(), jsonb_build_object('stock', jsonb_build_object('fridge', 1e300, 'freezer', '99999999999999999999'),
+  'tracking', jsonb_build_object('mealCursor', 1), 'calendar', jsonb_build_object('endpoint', 'https://evil.example/exec?token=x'),
+  'settings', jsonb_build_object('containersPerDay', repeat('x', 5000)), 'history', jsonb_build_array(jsonb_build_object('at', repeat('9', 5000), 'action', 'x'))),
+  'dev-f', 1) as r_f \gset
+:asOwner
+select pg_temp.ok((select meal_cursor from dog_log.state where owner_id = :F) >= now() - interval '400 days', '23 ancient seed mealCursor is bounded to 400 days');
+select pg_temp.ok((select (doc #>> '{stock,fridge}')::numeric from dog_log.state where owner_id = :F) <= 1000000
+              and (select (doc #>> '{stock,freezer}')::numeric from dog_log.state where owner_id = :F) <= 1000000, '23 absurd stock values are bounded');
+select pg_temp.ok((select doc #>> '{calendar,endpoint}' from dog_log.state where owner_id = :F) = '', '23 seed stores only an Apps Script /exec endpoint');
+select pg_temp.ok((select length(doc::text) from dog_log.state where owner_id = :F) < 5000, '23 oversized legacy/at strings are bounded');
+:asF
+select dog_log.sync(jsonb_build_array(
+  jsonb_build_object('mutation_id', gen_random_uuid(), 'type', 'adjust', 'key', 'fridge', 'delta', 9e300, 'client_created_at', now()),
+  jsonb_build_object('mutation_id', gen_random_uuid(), 'type', 'set', 'key', 'fridge', 'value', 1, 'expected', 'x', 'client_created_at', now()),
+  jsonb_build_object('mutation_id', gen_random_uuid(), 'type', 'replace_state', 'doc', '{}'::jsonb, 'expected_revision', 1.5, 'client_created_at', now())),
+  'dev-f', 1) as r_over \gset
+select dog_log.sync('[]'::jsonb, 'dev-f', 1) as r_after \gset
+:asOwner
+select pg_temp.ok((:'r_over'::jsonb -> 'results' -> 0 ->> 'status') = 'rejected'
+              and (:'r_over'::jsonb -> 'results' -> 1 ->> 'status') = 'rejected'
+              and (:'r_over'::jsonb -> 'results' -> 2 ->> 'status') = 'rejected'
+              and (:'r_after'::jsonb ->> 'status') = 'ok', '23 overflow/garbage ops are rejected and the account keeps syncing');
+select pg_temp.ok(not (:'r_over'::jsonb::text like '%error%'), '23 no raw database error text returned to the client');
+do $$ begin
+  perform set_config('request.jwt.claims', '{"sub":"99999999-0000-4000-8000-000000000009"}', true);
+  set local role authenticated;
+  perform dog_log.seed_state(gen_random_uuid(), '{}'::jsonb, 'x', 0);
+  raise exception 'FAIL: seed from an outdated client accepted';
+exception when invalid_parameter_value then raise notice 'ok   23 seed_state enforces the client version gate';
+end $$;
+:asOwner
+-- ops are applied in client_created_at order even when submitted out of order; results keep submitted order
+:asG
+select dog_log.seed_state(gen_random_uuid(), jsonb_build_object('stock', jsonb_build_object('fridge', 0, 'freezer', 0),
+  'tracking', jsonb_build_object('mealCursor', (extract(epoch from now() - interval '40 hours') * 1000)::bigint)), 'dev-g', 1) \g /dev/null
+select dog_log.sync(jsonb_build_array(
+  jsonb_build_object('mutation_id', '77777777-7777-4777-8777-777777777777', 'type', 'adjust', 'key', 'fridge', 'delta', 1, 'client_created_at', now() - interval '10 hours'),
+  jsonb_build_object('mutation_id', '88888888-8888-4888-8888-888888888888', 'type', 'adjust', 'key', 'fridge', 'delta', 2, 'client_created_at', now() - interval '35 hours')),
+  'dev-g', 1) as r_order \gset
+:asOwner
+select pg_temp.ok((:'r_order'::jsonb -> 'results' -> 0 ->> 'mutation_id') = '77777777-7777-4777-8777-777777777777',
+                  '23 results are returned in submitted order');
+select pg_temp.ok((select outcome from dog_log.meal_events where owner_id = :G and slot_at > now() - interval '35 hours' order by slot_at limit 1) = 'fed',
+                  '23 an earlier-made op submitted later is still applied before the meals after it');
+-- a caller's temporary objects cannot shadow type names inside the RPCs (pg_temp is searched last)
+:asA
+create temp table timestamptz (x int);
+create temp table uuid (x int);
+create temp table jsonb (x int);
+create temp table text (x int);
+create temp table numeric (x int);
+select dog_log.sync(jsonb_build_array(jsonb_build_object('mutation_id', gen_random_uuid(), 'type', 'adjust', 'key', 'lykaPackets', 'delta', 1,
+  'client_created_at', now(), 'label', 'Lyka +1')), 'dev-a', 1) ->> 'status' as r_hijack \gset
+drop table pg_temp.timestamptz, pg_temp.uuid, pg_temp.jsonb, pg_temp.text, pg_temp.numeric;
+:asOwner
+select pg_temp.ok(:'r_hijack' = 'ok', '23 temp tables named timestamptz/uuid/jsonb/text/numeric do not affect the RPCs');
 
 select 'ALL DOG_LOG SQL TESTS PASSED';
 rollback;
