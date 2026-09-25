@@ -36,25 +36,25 @@ test('31 there is no Save settings button; Total containers saves on blur as exa
   await expect(a.page.locator('#settingsSaveStatus')).toHaveText('', { timeout: 5000 }); // feedback clears itself
 });
 
-test('32 Mince increment commits on Enter once: the blur that follows does not save it again', async ({ device, backend }) => {
+test('32 Total containers commits on Enter once: the blur that follows does not save it again', async ({ device, backend }) => {
   const a = await settingsDevice({ device, backend });
-  await a.page.fill('#setMinceIncrement', '0.5');
-  await a.page.press('#setMinceIncrement', 'Enter');
+  await a.page.fill('#setTotal', '122');
+  await a.page.press('#setTotal', 'Enter');
   await a.page.locator('#setTotal').focus();
   await a.page.locator('#setTotal').blur();
   await waitSynced(a.page);
-  expect(sentSettings(backend)).toMatchObject([{ field: 'mincePurchaseIncrementKg', value: 0.5, expected: 1 }]);
+  expect(sentSettings(backend)).toMatchObject([{ field: 'totalContainers', value: 122, expected: 120 }]);
   expect(await backend.ledger(a.owner)).toHaveLength(1);
-  expect((await backend.state(a.owner)).doc.settings.mincePurchaseIncrementKg).toBe(0.5);
-  await expect(a.page.locator('#setMinceIncrement')).toHaveValue('0.5');
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 122, mincePurchaseIncrementKg: 1 });
+  await expect(a.page.locator('#setTotal')).toHaveValue('122');
 });
 
 test('33 focusing and leaving a field, or re-entering the same value, creates no mutation', async ({ device, backend }) => {
   const a = await settingsDevice({ device, backend });
   const rev = (await backend.state(a.owner)).revision;
-  for (const id of ['#setTotal', '#setMinceIncrement']) { await a.page.locator(id).focus(); await a.page.locator(id).blur(); }
+  await a.page.locator('#setTotal').focus(); await a.page.locator('#setTotal').blur();
   await a.page.fill('#setTotal', '120.0'); await a.page.locator('#setTotal').blur();        // same number, different text
-  await a.page.fill('#setMinceIncrement', '1.000'); await a.page.press('#setMinceIncrement', 'Enter');
+  await a.page.fill('#setTotal', '120'); await a.page.press('#setTotal', 'Enter');
   await a.page.waitForTimeout(800);
   await waitSynced(a.page);
   expect(sentSettings(backend)).toEqual([]);
@@ -68,7 +68,7 @@ test('34 populating the fields from the cloud (adoption, reload, render) never s
   const b = await secondDevice({ device, backend }); // its own local settings (7 / 3) are backed up, not uploaded
   await g(b.page, () => showView('settings'));
   await expect(b.page.locator('#setTotal')).toHaveValue('120');
-  await expect(b.page.locator('#setMinceIncrement')).toHaveValue('1');
+  await expect(b.page.locator('#setMinceIncrement')).toHaveCount(0);
   await b.page.reload();
   await waitSynced(b.page);
   await g(b.page, () => { for (let i = 0; i < 5; i++) { showView('settings'); render(); refreshView(); } });
@@ -108,7 +108,7 @@ test('35 a realtime change updates the other device\'s fields with no echo; an e
 
 test('36 invalid values are not saved and the last good value is kept', async ({ device, backend }) => {
   const a = await settingsDevice({ device, backend });
-  for (const [id, bad] of [['#setTotal', ''], ['#setTotal', '-3'], ['#setTotal', '12.5'], ['#setMinceIncrement', '0'], ['#setMinceIncrement', '-1'], ['#setMinceIncrement', '']]) {
+  for (const [id, bad] of [['#setTotal', ''], ['#setTotal', '-3'], ['#setTotal', '12.5'], ['#setTotal', '0.5'], ['#setTotal', '2000000']]) {
     await a.page.fill(id, bad);
     await a.page.locator(id).blur();
     await expect(a.page.locator('#settingsSaveStatus')).toContainText('Not saved');
@@ -117,7 +117,6 @@ test('36 invalid values are not saved and the last good value is kept', async ({
   expect(sentSettings(backend)).toEqual([]);
   expect(await outboxOps(a.page)).toEqual([]);
   await expect(a.page.locator('#setTotal')).toHaveValue('120');
-  await expect(a.page.locator('#setMinceIncrement')).toHaveValue('1');
   expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 120, mincePurchaseIncrementKg: 1 });
   await a.page.fill('#setTotal', '121'); // a valid value afterwards still saves normally
   await a.page.locator('#setTotal').blur();
@@ -198,10 +197,10 @@ test('40 without cloud sync, a settings field saves locally on blur with no butt
   const s = JSON.parse(await raw(d.page));
   expect(s.settings).toMatchObject({ totalContainers: 126, mincePurchaseIncrementKg: 1 });
   expect(s.history[0].action).toBe('Food settings updated');
-  await d.page.fill('#setMinceIncrement', '0');
-  await d.page.locator('#setMinceIncrement').blur();
+  await d.page.fill('#setTotal', '-1');
+  await d.page.locator('#setTotal').blur();
   await expect(d.page.locator('#settingsSaveStatus')).toContainText('Not saved');
-  expect(JSON.parse(await raw(d.page)).settings.mincePurchaseIncrementKg).toBe(1);
+  expect(JSON.parse(await raw(d.page)).settings).toMatchObject({ totalContainers: 126, mincePurchaseIncrementKg: 1 });
 });
 
 test('41 leaving a field without editing shows a value that changed elsewhere meanwhile, and the next edit is based on it', async ({ device, backend }) => {
