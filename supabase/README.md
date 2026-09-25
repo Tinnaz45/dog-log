@@ -33,10 +33,12 @@ This folder holds the Dog Log cloud-sync database: the `dog_log` schema in the s
 
 ## Applying (not done by merging)
 
-Merging this folder applies nothing (ENVIRONMENT_LIFECYCLE §10.1). Each step below is a separate act:
+Merging this folder applies nothing (ENVIRONMENT_LIFECYCLE §10.1). Each step below is a separate act.
 
-1. **DEV** (`kctctvpobbizhkiqkgqw`): apply the migration, then add `dog_log` to *Settings → API → Exposed schemas*. Add it; never remove another app's entry. Then run `tests/dog_log_sync.sql` as the owner. It rolls back and leaves no rows.
-2. **PROD** (`wgcqzamuspuqpedqasbc`): this needs **explicit operator approval for this specific migration**. Apply, add the exposed schema, and verify grants with `has_table_privilege` and `has_function_privilege`.
+**Dog Log is Supabase PROD-only** (operator decision, WORK-136, 2026-09-25). It is a personal app with a `main`-only repository and one Production deployment, so it keeps **no** persistent schema, data or Exposed-schemas entry in Supabase DEV. Validate database changes on a disposable local PostgreSQL (below) before a controlled PROD apply.
+
+1. **DEV** (`kctctvpobbizhkiqkgqw`): **do not apply.** This migration was applied to DEV once for validation (history `20260924234922`). It was then rolled back with the rollback file, recorded as `dog_log_create_sync_schema_rollback` (`20260925001719`). DEV holds no `dog_log` objects and `dog_log` was never exposed there.
+2. **PROD** (`wgcqzamuspuqpedqasbc`): this needs **explicit operator approval for this specific migration**. Apply, add `dog_log` to *Settings → API → Exposed schemas* (add it; never remove another app's entry), and verify grants with `has_table_privilege` and `has_function_privilege`.
 3. The migration adds only `dog_log.state` to the `supabase_realtime` publication.
 
 ## Local tests (disposable database only)
