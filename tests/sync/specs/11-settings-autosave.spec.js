@@ -203,3 +203,24 @@ test('40 without cloud sync, a settings field saves locally on blur with no butt
   await expect(d.page.locator('#settingsSaveStatus')).toContainText('Not saved');
   expect(JSON.parse(await raw(d.page)).settings.mincePurchaseIncrementKg).toBe(1);
 });
+
+test('41 leaving a field without editing shows a value that changed elsewhere meanwhile, and the next edit is based on it', async ({ device, backend }) => {
+  const a = await settingsDevice({ device, backend });
+  const b = await secondDevice({ device, backend });
+  await g(b.page, () => showView('settings'));
+  await subscribed(backend, a.owner, 2);
+  await b.page.locator('#setTotal').focus();
+  await a.page.fill('#setTotal', '133');
+  await a.page.locator('#setTotal').blur();
+  await waitSynced(a.page);
+  await expect.poll(() => g(b.page, () => cache.revision)).toBe((await backend.state(a.owner)).revision);
+  await expect(b.page.locator('#setTotal')).toHaveValue('120'); // not overwritten while being edited
+  await b.page.locator('#setTotal').blur();
+  await expect(b.page.locator('#setTotal')).toHaveValue('133'); // refreshed once the edit ends
+  await b.page.fill('#setTotal', '134');
+  await b.page.locator('#setTotal').blur();
+  await waitSynced(b.page);
+  expect(sentSettings(backend).map(o => [o.value, o.expected])).toEqual([[133, 120], [134, 133]]);
+  expect((await backend.ledger(a.owner)).map(r => r.status)).toEqual(['applied', 'applied']);
+  expect(await g(b.page, () => review.length)).toBe(0);
+});
