@@ -61,19 +61,19 @@ test('10 a prep batch maps to prep_batch with conditional ingredient left-overs'
   expect(doc.batches[0]).toMatchObject({ containers: 6, minceUsedKg: 2, neckPacketsUsed: 2 });
 });
 
-test('11 food settings map to one conditional settings operation per changed field', async ({ device, backend }) => {
+test('11 food settings map to one conditional settings operation per changed field, saved as each field is committed', async ({ device, backend }) => {
   const a = await seededDevice({ device, backend });
   backend.down = true;
   await g(a.page, () => showView('settings'));
   await a.page.fill('#setTotal', '45');
+  await a.page.locator('#setTotal').blur();
   await a.page.fill('#setMinceIncrement', '1');
-  await a.page.click('button:has-text("Save settings")');
+  await a.page.press('#setMinceIncrement', 'Enter');
   const ops = await outboxOps(a.page);
   expect(ops).toMatchObject([
     { type: 'settings', field: 'totalContainers', value: 45, expected: 40, label: 'Food settings updated' },
-    { type: 'settings', field: 'mincePurchaseIncrementKg', value: 1, expected: 0.5 },
+    { type: 'settings', field: 'mincePurchaseIncrementKg', value: 1, expected: 0.5, label: 'Food settings updated' },
   ]);
-  expect(ops[1].label).toBeUndefined();
   await online(a.page, backend);
   expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 45, mincePurchaseIncrementKg: 1 });
 });
