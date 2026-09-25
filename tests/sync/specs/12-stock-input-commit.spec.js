@@ -143,3 +143,47 @@ test('49 without cloud sync, a re-render during an edit keeps the typed value an
   await d.page.locator('#fridgeVal').focus();
   expect(JSON.parse(await raw(d.page)).stock.freezer).toBe(9);
 });
+
+test('50 a meal slot passing while Fridge is being edited does not turn the recount into a conflict', async ({ device, backend }) => {
+  const a = await seededDevice({ device, backend });
+  await a.page.locator('#fridgeVal').focus(); // the user sees 5 and starts recounting
+  // Meal slots pass during the edit: the edit began 13 h ago, and the server has meals due since then.
+  await g(a.page, () => { fridgeVal.dataset.seenAt = String(Date.now() - 13 * 3600 * 1000); });
+  const rev = (await backend.state(a.owner)).revision;
+  await backend.pool.query("update dog_log.state set meal_cursor = now() - interval '13 hours' where owner_id = $1", [a.owner]);
+  await g(a.page, () => syncNow('test'));
+  await expect.poll(() => g(a.page, () => cache.revision)).toBeGreaterThan(rev);
+  const fridgeNow = (await backend.state(a.owner)).doc.stock.fridge;
+  expect(fridgeNow).toBeLessThan(5); // a meal was deducted by the server
+  await expect(a.page.locator('#fridgeVal')).toHaveValue('5'); // the focused field was not rewritten
+  const recount = fridgeNow + 1; // a recount that differs from the post-meal value
+  await a.page.keyboard.type(String(recount));
+  await a.page.keyboard.press('Enter');
+  await waitSynced(a.page);
+  expect(sentSets(backend)).toMatchObject([{ key: 'fridge', value: recount, expected: fridgeNow }]); // not the pre-meal 5
+  expect((await backend.ledger(a.owner)).map(r => r.status)).toEqual(['applied']);
+  expect((await backend.state(a.owner)).doc.stock.fridge).toBe(recount);
+  expect(await g(a.page, () => review.length)).toBe(0);
+});
+
+test('51 tapping ± while a stock field is being edited ends that edit first, then adjusts', async ({ device, backend }) => {
+  const a = await seededDevice({ device, backend });
+  await typeInto(a.page, '#fridgeVal', '7');
+  await a.page.evaluate(() => adjust('fridge', 1)); // iOS: tapping the button leaves the field focused
+  await waitSynced(a.page);
+  expect((await backend.ledger(a.owner)).map(r => [r.op_type, r.status])).toEqual([['set', 'applied'], ['adjust', 'applied']]);
+  expect((await backend.state(a.owner)).doc.stock.fridge).toBe(8);
+  await expect(a.page.locator('#fridgeVal')).toHaveValue('8');
+});
+
+test('52 hiding a signed-out (read-only) app mid-edit reverts the field without an alert', async ({ device, backend }) => {
+  const a = await seededDevice({ device, backend });
+  await a.page.evaluate(() => { meta.mode = 'signed-out'; render(); });
+  const dialogsBefore = a.dialogs.length; // the seed confirmation from setup
+  await typeInto(a.page, '#lykaVal', '9');
+  await hide(a.page);
+  await a.page.waitForTimeout(300);
+  expect(a.dialogs.length).toBe(dialogsBefore); // no alert() while hidden
+  await expect(a.page.locator('#lykaVal')).toHaveValue('4');
+  expect(await outboxOps(a.page)).toEqual([]);
+});
