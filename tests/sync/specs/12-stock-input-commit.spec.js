@@ -156,7 +156,7 @@ test('50 a meal slot passing while Fridge is being edited does not turn the reco
   const fridgeNow = (await backend.state(a.owner)).doc.stock.fridge;
   expect(fridgeNow).toBeLessThan(5); // a meal was deducted by the server
   await expect(a.page.locator('#fridgeVal')).toHaveValue('5'); // the focused field was not rewritten
-  const recount = fridgeNow + 1; // a recount that differs from the post-meal value
+  const recount = 9; // differs from both the value on screen (5) and the post-meal value (<5), whatever the time of day
   await a.page.keyboard.type(String(recount));
   await a.page.keyboard.press('Enter');
   await waitSynced(a.page);
