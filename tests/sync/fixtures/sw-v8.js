@@ -1,7 +1,5 @@
-const CACHE = 'dog-log-v9';
-// The vendored library is version-named: a new version gets a new URL, and any change to a precached
-// non-HTML asset must also bump CACHE.
-const ASSETS = ['/', '/index.html', '/manifest.json', '/vendor/supabase-js-2.116.0.min.js'];
+const CACHE = 'dog-log-v8';
+const ASSETS = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS.map(u => new Request(u, { cache: 'reload' })))));
@@ -16,12 +14,8 @@ self.addEventListener('activate', e => {
 });
 
 self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  // Cloud sync (Supabase REST/RPC/Auth), the Apps Script calendar bridge, any other origin and every non-GET
-  // request go straight to the network: never answered from, or written to, Cache Storage.
-  if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
   // Icons always come from the network so a stale cache can never substitute an old icon.
-  if (url.pathname.endsWith('.png')) return;
+  if (new URL(e.request.url).pathname.endsWith('.png')) return;
   // Pages are network-first so new HTML (and its icon declarations) is seen immediately; cache is the offline fallback.
   if (e.request.mode === 'navigate') {
     e.respondWith(
