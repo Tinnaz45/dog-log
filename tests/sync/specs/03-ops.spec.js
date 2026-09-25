@@ -67,15 +67,14 @@ test('11 food settings map to one conditional settings operation per changed fie
   await g(a.page, () => showView('settings'));
   await a.page.fill('#setTotal', '45');
   await a.page.locator('#setTotal').blur();
-  await a.page.fill('#setMinceIncrement', '1');
-  await a.page.press('#setMinceIncrement', 'Enter');
   const ops = await outboxOps(a.page);
   expect(ops).toMatchObject([
     { type: 'settings', field: 'totalContainers', value: 45, expected: 40, label: 'Food settings updated' },
-    { type: 'settings', field: 'mincePurchaseIncrementKg', value: 1, expected: 0.5, label: 'Food settings updated' },
   ]);
+  expect(ops).toHaveLength(1);
   await online(a.page, backend);
-  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 45, mincePurchaseIncrementKg: 1 });
+  // The retired mincePurchaseIncrementKg an older copy carried is left exactly as stored.
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 45, mincePurchaseIncrementKg: 0.5 });
 });
 
 test('12 the calendar endpoint syncs as a setting; the pairing token never leaves the device', async ({ device, backend }) => {
