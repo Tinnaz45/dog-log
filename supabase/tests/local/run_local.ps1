@@ -51,6 +51,7 @@ try {
   & (Join-Path $Bin 'initdb.exe') -D "$Work\data" -U postgres --auth=trust -E UTF8 | Out-Null
   # Start-Process, not a pipeline: the server inherits pg_ctl's handles and would keep a pipe open forever.
   $p = Start-Process -FilePath (Join-Path $Bin 'pg_ctl.exe') -ArgumentList @('-D', "`"$Work\data`"", '-o', "`"-p $Port -c listen_addresses=127.0.0.1`"", '-l', "`"$Work\log`"", '-w', 'start') -NoNewWindow -PassThru
+  $null = $p.Handle  # cache the handle now, or Windows PowerShell reports a null ExitCode
   $p.WaitForExit()   # not -Wait: in Windows PowerShell that also waits for the (long-lived) server process
   if ($p.ExitCode -ne 0) { Fail 'pg_ctl start' }
 

@@ -1,6 +1,6 @@
 // Food settings autosave (WORK-136 #25): each field commits on Enter/blur as one reviewed settings mutation; nothing the
 // app writes into the fields itself (render, adoption, realtime) ever saves; the prep batch stays one deliberate transaction.
-const { test, expect, g, raw, outboxOps, signIn, waitSynced, seededDevice, fixture, setOffline } = require('../lib/helpers');
+const { SCHEDULE_DEFAULTS, test, expect, g, raw, outboxOps, signIn, waitSynced, seededDevice, fixture, setOffline } = require('../lib/helpers');
 
 const SETTINGS = { totalContainers: 120, containersPerDay: 2, mincePurchaseIncrementKg: 1 };
 const sentOps = backend => backend.rpcCalls('sync').flatMap(c => JSON.parse(c.body).p_mutations || []);
@@ -32,7 +32,7 @@ test('31 there is no Save settings button; Total containers saves on blur as exa
   await expect(a.page.locator('#settingsSaveStatus')).toHaveText('Saved');
   expect(sentSettings(backend)).toMatchObject([{ field: 'totalContainers', value: 125, expected: 120, label: 'Food settings updated' }]);
   expect(await backend.ledger(a.owner)).toMatchObject([{ op_type: 'settings', status: 'applied', detail: { field: 'totalContainers', before: 120, after: 125 } }]);
-  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 125, mincePurchaseIncrementKg: 1 });
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 125, mincePurchaseIncrementKg: 1, ...SCHEDULE_DEFAULTS });
   await expect(a.page.locator('#settingsSaveStatus')).toHaveText('', { timeout: 5000 }); // feedback clears itself
 });
 
@@ -45,7 +45,7 @@ test('32 Total containers commits on Enter once: the blur that follows does not 
   await waitSynced(a.page);
   expect(sentSettings(backend)).toMatchObject([{ field: 'totalContainers', value: 122, expected: 120 }]);
   expect(await backend.ledger(a.owner)).toHaveLength(1);
-  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 122, mincePurchaseIncrementKg: 1 });
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 122, mincePurchaseIncrementKg: 1, ...SCHEDULE_DEFAULTS });
   await expect(a.page.locator('#setTotal')).toHaveValue('122');
 });
 
@@ -77,7 +77,7 @@ test('34 populating the fields from the cloud (adoption, reload, render) never s
   await b.page.waitForTimeout(800);
   expect(sentOps(backend)).toEqual([]);
   expect(await backend.ledger(a.owner)).toEqual([]);
-  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 120, mincePurchaseIncrementKg: 1 });
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 120, mincePurchaseIncrementKg: 1, ...SCHEDULE_DEFAULTS });
 });
 
 test('35 a realtime change updates the other device\'s fields with no echo; an edit started before it becomes Needs review', async ({ device, backend }) => {
@@ -117,7 +117,7 @@ test('36 invalid values are not saved and the last good value is kept', async ({
   expect(sentSettings(backend)).toEqual([]);
   expect(await outboxOps(a.page)).toEqual([]);
   await expect(a.page.locator('#setTotal')).toHaveValue('120');
-  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 120, mincePurchaseIncrementKg: 1 });
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 120, mincePurchaseIncrementKg: 1, ...SCHEDULE_DEFAULTS });
   await a.page.fill('#setTotal', '121'); // a valid value afterwards still saves normally
   await a.page.locator('#setTotal').blur();
   await waitSynced(a.page);

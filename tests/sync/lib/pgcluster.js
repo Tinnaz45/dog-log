@@ -38,12 +38,16 @@ function start(port) {
   fs.chmodSync(work, 0o777);
   for (const f of [STUB, ...MIGRATIONS]) { fs.copyFileSync(f, path.join(work, path.basename(f))); fs.chmodSync(path.join(work, path.basename(f)), 0o644); }
   run(path.join(bin, 'initdb'), ['-D', path.join(work, 'data'), '-U', 'postgres', '--auth=trust', '-E', 'UTF8']);
-  run(path.join(bin, 'pg_ctl'), ['-D', path.join(work, 'data'), '-o', `-p ${port} -k ${work} -c listen_addresses=''`, '-l', path.join(work, 'log'), '-w', 'start']);
-  const psql = (file) => run(path.join(bin, 'psql'), ['-h', work, '-p', String(port), '-U', 'postgres', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-f', path.join(work, path.basename(file))]);
+  // Unix socket in the work directory; on Windows, TCP on 127.0.0.1 (and the server must not inherit pg_ctl's pipes).
+  const win = process.platform === 'win32', host = win ? '127.0.0.1' : work;
+  const listen = win ? `-p ${port} -c listen_addresses=127.0.0.1` : `-p ${port} -k ${work} -c listen_addresses=''`;
+  const ctl = [path.join(bin, 'pg_ctl'), ['-D', path.join(work, 'data'), '-o', listen, '-l', path.join(work, 'log'), '-w', 'start']];
+  if (win) { if (spawnSync(...ctl, { stdio: 'ignore' }).status !== 0) throw new Error('pg_ctl start failed'); } else run(...ctl);
+  const psql = (file) => run(path.join(bin, 'psql'), ['-h', host, '-p', String(port), '-U', 'postgres', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-f', path.join(work, path.basename(file))]);
   psql(STUB);
   for (const migration of MIGRATIONS) psql(migration);
   return {
-    host: work,
+    host,
     port,
     stop() {
       try { run(path.join(bin, 'pg_ctl'), ['-D', path.join(work, 'data'), '-m', 'immediate', 'stop']); } catch (e) { /* already stopped */ }
