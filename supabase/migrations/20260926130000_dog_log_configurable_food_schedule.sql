@@ -40,7 +40,7 @@ begin
   loop
     execute format('alter table dog_log.meal_events drop constraint %I', c.conname);
   end loop;
-end $$;
+end; $$;
 
 alter table dog_log.meal_events
   add constraint meal_events_slot_check check (slot in ('breakfast', 'dinner', 'transfer')),
@@ -81,7 +81,7 @@ begin
                         else 'null'::jsonb end;
   end if;
   return null;
-end $$;
+end; $$;
 
 -- Configured local time of a scheduled slot.
 create or replace function dog_log._sched_time(p_doc jsonb, p_slot text)
@@ -162,7 +162,7 @@ begin
     'legacy',   jsonb_build_object(
       'containersPerDay', case when jsonb_typeof(st -> 'containersPerDay') = 'number' then to_jsonb(dog_log._num(st -> 'containersPerDay')) else '2'::jsonb end,
       'lastAutoDate',     case when jsonb_typeof(tr -> 'lastAutoDate') = 'string' then to_jsonb(left(tr ->> 'lastAutoDate', 40)) else 'null'::jsonb end));
-end $$;
+end; $$;
 
 -- ------------------------------------------------------ scheduled-event engine
 -- Processes every scheduled event in (meal_cursor, p_until] exactly once, using the
@@ -329,7 +329,7 @@ begin
     update dog_log.state set doc = v_doc, meal_cursor = v_cursor where owner_id = p_owner;
   end if;
   return v_changed;
-end $$;
+end; $$;
 
 -- ----------------------------------------------------------------- operations
 create or replace function dog_log._apply_op(p_owner uuid, p_op jsonb, p_cc timestamptz, p_start_revision bigint)
@@ -602,7 +602,7 @@ begin
   end if;
   update dog_log.state set doc = v_doc where owner_id = p_owner;
   return jsonb_build_object('status', v_status, 'detail', v_detail);
-end $$;
+end; $$;
 
 -- recent_meals also reports each row's transfer count, so a client can mirror recount
 -- rebasing and recognise WORK-147 dinner rows that already carried the day's transfer.
@@ -721,7 +721,7 @@ begin
   select owner_id, 'seed', revision, doc from dog_log.state where owner_id = v_owner;
 
   return jsonb_build_object('status', 'seeded', 'state', dog_log._state_json(v_owner));
-end $$;
+end; $$;
 
 -- ------------------------------------------------------------------ privileges
 revoke all on function
