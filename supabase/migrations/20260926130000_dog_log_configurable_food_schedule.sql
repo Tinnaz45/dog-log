@@ -72,7 +72,7 @@ begin
   if p_field in ('fridgeTransferCount', 'maxFreezerContainers', 'maxFridgeContainers') then
     if jsonb_typeof(v) = 'number' then
       n := (v #>> '{}')::numeric;
-      if n = round(n) and n >= 0 and n <= case p_field when 'fridgeTransferCount' then 100 else 1000000 end then
+      if n = round(n) and n >= 0 and n <= (case p_field when 'fridgeTransferCount' then 100 else 1000000 end) then
         return to_jsonb(round(n));
       end if;
     end if;
@@ -492,7 +492,7 @@ begin
       v_ok := false;
       if jsonb_typeof(v_jval) = 'number' then
         v_val := (v_jval #>> '{}')::numeric;
-        if v_val = round(v_val) and v_val between 0 and case v_key when 'fridgeTransferCount' then 100 else 1000000 end then
+        if v_val = round(v_val) and v_val between 0 and (case v_key when 'fridgeTransferCount' then 100 else 1000000 end) then
           v_ok := true;
           v_jval := to_jsonb(round(v_val));
         end if;
