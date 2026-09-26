@@ -1,5 +1,5 @@
 // Operation mapping: every user action becomes one reviewed operation type; rendering never writes.
-const { test, expect, g, raw, outboxOps, waitSynced, seededDevice } = require('../lib/helpers');
+const { SCHEDULE_DEFAULTS, test, expect, g, raw, outboxOps, waitSynced, seededDevice } = require('../lib/helpers');
 
 const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 async function online(page, backend) { backend.down = false; await page.evaluate(() => window.dispatchEvent(new Event('online'))); await waitSynced(page); }
@@ -74,7 +74,7 @@ test('11 food settings map to one conditional settings operation per changed fie
   expect(ops).toHaveLength(1);
   await online(a.page, backend);
   // The retired mincePurchaseIncrementKg an older copy carried is left exactly as stored.
-  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 45, mincePurchaseIncrementKg: 0.5 });
+  expect((await backend.state(a.owner)).doc.settings).toEqual({ totalContainers: 45, mincePurchaseIncrementKg: 0.5, ...SCHEDULE_DEFAULTS });
 });
 
 test('12 the calendar endpoint syncs as a setting; the pairing token never leaves the device', async ({ device, backend }) => {

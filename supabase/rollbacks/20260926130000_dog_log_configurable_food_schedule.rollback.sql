@@ -5,7 +5,7 @@
 -- Restores, verbatim, the function bodies that were live before WORK-148:
 --   _norm_doc, _state_json, seed_state        (20260924225253 base migration)
 --   _process_due_meals, _apply_op             (20260926005200 WORK-147 migration)
--- and drops the WORK-148 helpers _setting and _sched_time.
+-- and drops the WORK-148 helpers _run_event, _setting and _sched_time.
 --
 -- Kept on purpose (data-preserving, like the WORK-147 rollback):
 --   * meal_events rows with slot = 'transfer' and the widened checks that allow
@@ -568,6 +568,7 @@ begin
   return jsonb_build_object('status', 'seeded', 'state', dog_log._state_json(v_owner));
 end $$;
 
+drop function if exists dog_log._run_event(uuid, jsonb, date, text, timestamptz, text, text, bigint);
 drop function if exists dog_log._sched_time(jsonb, text);
 drop function if exists dog_log._setting(jsonb, text);
 

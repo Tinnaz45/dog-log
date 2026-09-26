@@ -42,6 +42,12 @@ begin
   end loop;
 end; $$;
 
+-- Re-runnable after the WORK-148 rollback, which keeps these named checks.
+alter table dog_log.meal_events
+  drop constraint if exists meal_events_slot_check,
+  drop constraint if exists meal_events_outcome_check,
+  drop constraint if exists meal_events_slot_outcome_check,
+  drop constraint if exists meal_events_freezer_to_fridge_count_check;
 alter table dog_log.meal_events
   add constraint meal_events_slot_check check (slot in ('breakfast', 'dinner', 'transfer')),
   add constraint meal_events_outcome_check check (outcome in ('fed', 'no-stock', 'before-tracking', 'transferred')),
@@ -60,19 +66,31 @@ comment on table dog_log.meal_events is
 create or replace function dog_log._setting(p_doc jsonb, p_field text)
 returns jsonb language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
 declare
-  v jsonb := p_doc -> 'settings' -> p_field;
-  n numeric;
+  v   jsonb := p_doc -> 'settings' -> p_field;
+  n   numeric;
+  lim numeric := case p_field when 'fridgeTransferCount' then 100 else 1000000 end;
+  b   text;
+  d   text;
 begin
-  if p_field in ('breakfastTime', 'dinnerTime', 'fridgeTransferTime') then
+  if p_field in ('breakfastTime', 'dinnerTime') then
+    -- Breakfast must come before Dinner; otherwise both read as the defaults (client: sched()).
+    b := dog_log._setting(p_doc, 'breakfastTimeRaw') #>> '{}';
+    d := dog_log._setting(p_doc, 'dinnerTimeRaw') #>> '{}';
+    if b >= d then b := '09:00'; d := '18:00'; end if;
+    return to_jsonb(case p_field when 'breakfastTime' then b else d end);
+  end if;
+  if p_field in ('breakfastTimeRaw', 'dinnerTimeRaw', 'fridgeTransferTime') then
+    v := p_doc -> 'settings' -> replace(p_field, 'Raw', '');
     if jsonb_typeof(v) = 'string' and (v #>> '{}') ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' then
       return v;
     end if;
-    return to_jsonb(case p_field when 'breakfastTime' then '09:00' else '18:00' end);
+    return to_jsonb(case p_field when 'breakfastTimeRaw' then '09:00' else '18:00' end);
   end if;
   if p_field in ('fridgeTransferCount', 'maxFreezerContainers', 'maxFridgeContainers') then
     if jsonb_typeof(v) = 'number' then
       n := (v #>> '{}')::numeric;
-      if n = round(n) and n >= 0 and n <= case p_field when 'fridgeTransferCount' then 100 else 1000000 end then
+      -- (plpgsql ends an IF condition at the first THEN, so no CASE inside it)
+      if n = round(n) and n >= 0 and n <= lim then
         return to_jsonb(round(n));
       end if;
     end if;
@@ -165,33 +183,99 @@ begin
 end; $$;
 
 -- ------------------------------------------------------ scheduled-event engine
+-- Runs one scheduled event (a meal or the daily transfer) exactly once: its stock
+-- effect happens only when the meal_events primary-key insert succeeds. A day whose
+-- WORK-147 Dinner already carried a transfer never gets a second one. Returns
+-- {doc, ran, meal, fed, moved, want, entry}; entry is the history line (null for a
+-- transfer configured to move 0). Caller holds the state row lock.
+create or replace function dog_log._run_event(p_owner uuid, p_doc jsonb, p_day date, p_slot text, p_at timestamptz,
+                                              p_tz text, p_device text, p_revision bigint)
+returns jsonb language plpgsql volatile set search_path = pg_catalog, pg_temp as $$
+declare
+  v_doc     jsonb := p_doc;
+  v_fridge  numeric := coalesce((p_doc #>> '{stock,fridge}')::numeric, 0);
+  v_freezer numeric := coalesce((p_doc #>> '{stock,freezer}')::numeric, 0);
+  v_want    numeric;
+  v_move    numeric;
+  v_ins     int := 0;
+  v_outcome text;
+  v_source  text;
+  v_label   text;
+  v_entry   text;
+begin
+  if p_slot = 'transfer' then
+    if exists (select 1 from dog_log.meal_events
+                where owner_id = p_owner and meal_date = p_day and slot = 'dinner'
+                  and freezer_to_fridge_count is not null) then
+      return jsonb_build_object('doc', v_doc, 'ran', false);
+    end if;
+    v_want := (dog_log._setting(p_doc, 'fridgeTransferCount') #>> '{}')::numeric;
+    v_move := least(greatest(v_freezer, 0), v_want);
+    insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, freezer_to_fridge_count, slot_at, processed_by_device, state_revision, origin)
+    values (p_owner, p_day, 'transfer', 'transferred', v_move::smallint, p_at, p_device, p_revision, 'server')
+    on conflict do nothing;
+    get diagnostics v_ins = row_count;
+    if v_ins = 0 then return jsonb_build_object('doc', v_doc, 'ran', false); end if;
+    if v_move > 0 then
+      v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(v_freezer - v_move));
+      v_doc := jsonb_set(v_doc, '{stock,fridge}',  to_jsonb(v_fridge + v_move));
+    end if;
+    if v_want > 0 then
+      v_label := to_char(p_at at time zone p_tz, 'HH24:MI') || ' freezer-to-fridge transfer ' || dog_log._fmt_day(p_at, p_tz);
+      v_entry := v_label || case when v_move = 0 then ': no Full Containers available in Freezer'
+                                 when v_move = 1 then ': 1 Full Container moved from Freezer to Fridge'
+                                 else ': ' || v_move::bigint || ' Full Containers moved from Freezer to Fridge' end;
+    end if;
+    return jsonb_build_object('doc', v_doc, 'ran', true, 'meal', false, 'fed', false,
+                              'moved', v_move, 'want', v_want, 'entry', v_entry);
+  end if;
+
+  if v_fridge + v_freezer > 0 then
+    v_outcome := 'fed';
+    v_source  := case when v_fridge > 0 then 'fridge' else 'freezer' end;
+  else
+    v_outcome := 'no-stock';
+    v_source  := null;
+  end if;
+  insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, source_container, slot_at, processed_by_device, state_revision, origin)
+  values (p_owner, p_day, p_slot, v_outcome, v_source, p_at, p_device, p_revision, 'server')
+  on conflict do nothing;
+  get diagnostics v_ins = row_count;
+  if v_ins = 0 then return jsonb_build_object('doc', v_doc, 'ran', false); end if;
+  v_label := case p_slot when 'breakfast' then 'Breakfast' else 'Dinner' end || ' ' || dog_log._fmt_day(p_at, p_tz);
+  if v_outcome = 'fed' then
+    -- client deductPrepared(1): fridge first, remainder from freezer
+    v_doc := jsonb_set(v_doc, '{stock,fridge}', to_jsonb(greatest(v_fridge - least(v_fridge, 1), 0)));
+    if v_fridge < 1 then
+      v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(greatest(v_freezer - least(v_freezer, 1 - v_fridge), 0)));
+    end if;
+    v_entry := v_label || ': 1 Full Container used (' || v_source || ')';
+  else
+    v_entry := v_label || ': no Full Container available';
+  end if;
+  return jsonb_build_object('doc', v_doc, 'ran', true, 'meal', true, 'fed', v_outcome = 'fed', 'moved', 0, 'entry', v_entry);
+end $$;
+
 -- Processes every scheduled event in (meal_cursor, p_until] exactly once, using the
 -- configured times. Each day's events run in time order; at an equal time the order
--- is Breakfast, Dinner, then the transfer. Deduction/transfer happens only when the
--- meal_events primary-key insert succeeds. Caller holds the state row lock.
+-- is Breakfast, Dinner, then the transfer. Caller holds the state row lock.
 create or replace function dog_log._process_due_meals(p_owner uuid, p_until timestamptz, p_device text)
 returns boolean language plpgsql volatile set search_path = pg_catalog, pg_temp as $$
 declare
   r           dog_log.state%rowtype;
   v_doc       jsonb;
   v_tz        text;
+  v_from      timestamptz;
   v_cursor    timestamptz;
   v_day       date;
   v_slot      text;
   v_slots     text[];
-  v_label     text;
   v_at        timestamptz;
-  v_fridge    numeric;
-  v_freezer   numeric;
-  v_outcome   text;
-  v_source    text;
-  v_ins       int;
+  v_res       jsonb;
   v_entries   text[] := '{}';
   v_fed       int := 0;
   v_meals     int := 0;
   v_transfers int := 0;
-  v_want      numeric;
-  v_move      numeric := 0;
   v_moved     numeric := 0;
   v_ttime     text;
   v_changed   boolean := false;
@@ -206,7 +290,6 @@ begin
   select * into r from dog_log.state where owner_id = p_owner for update;
   if not found then return false; end if;
   v_doc := r.doc; v_tz := r.time_zone; v_cursor := r.meal_cursor;
-  v_want  := (dog_log._setting(v_doc, 'fridgeTransferCount') #>> '{}')::numeric;
   v_ttime := dog_log._setting(v_doc, 'fridgeTransferTime') #>> '{}';
   select array_agg(x.s order by dog_log._sched_time(v_doc, x.s), x.o) into v_slots
     from (values ('breakfast', 0), ('dinner', 1), ('transfer', 2)) x(s, o);
@@ -235,77 +318,26 @@ begin
   if p_until <= v_cursor then return false; end if;
   -- Bound the catch-up walk (at most ~1200 events) so a corrupt or ancient cursor can
   -- never make every sync time out; older slots are beyond meal_events retention anyway.
-  v_cursor := greatest(v_cursor, p_until - interval '400 days');
+  -- v_from stays fixed for the walk, so events sharing a time (Dinner and the transfer) are all due.
+  v_from := greatest(v_cursor, p_until - interval '400 days');
 
-  for v_day in select d::date from generate_series((v_cursor at time zone v_tz)::date, (p_until at time zone v_tz)::date, interval '1 day') d loop
+  for v_day in select d::date from generate_series((v_from at time zone v_tz)::date, (p_until at time zone v_tz)::date, interval '1 day') d loop
     foreach v_slot in array v_slots loop
       v_at := (v_day + dog_log._sched_time(v_doc, v_slot)) at time zone v_tz;
-      continue when v_at <= v_cursor or v_at > p_until;
-
-      v_fridge  := coalesce((v_doc #>> '{stock,fridge}')::numeric, 0);
-      v_freezer := coalesce((v_doc #>> '{stock,freezer}')::numeric, 0);
-
-      if v_slot = 'transfer' then
-        v_ins := 0;
-        -- A WORK-147 Dinner already moved this day's containers: never transfer twice.
-        if not exists (select 1 from dog_log.meal_events
-                        where owner_id = p_owner and meal_date = v_day and slot = 'dinner'
-                          and freezer_to_fridge_count is not null) then
-          v_move := least(greatest(v_freezer, 0), v_want);
-          insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, freezer_to_fridge_count, slot_at, processed_by_device, state_revision, origin)
-          values (p_owner, v_day, 'transfer', 'transferred', v_move::smallint, v_at, p_device, r.revision + 1, 'server')
-          on conflict do nothing;
-          get diagnostics v_ins = row_count;
-        end if;
-        if v_ins = 1 then
-          if v_move > 0 then
-            v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(v_freezer - v_move));
-            v_doc := jsonb_set(v_doc, '{stock,fridge}',  to_jsonb(v_fridge + v_move));
-          end if;
-          if v_want > 0 then
-            v_transfers := v_transfers + 1;
-            v_moved := v_moved + v_move;
-            v_label := v_ttime || ' freezer-to-fridge transfer ' || dog_log._fmt_day(v_at, v_tz);
-            if v_move = 0 then
-              v_entries := v_entries || (v_label || ': no Full Containers available in Freezer');
-            elsif v_move = 1 then
-              v_entries := v_entries || (v_label || ': 1 Full Container moved from Freezer to Fridge');
-            else
-              v_entries := v_entries || (v_label || ': ' || v_move::bigint || ' Full Containers moved from Freezer to Fridge');
-            end if;
-          end if;
-        end if;
-      else
-        if v_fridge + v_freezer > 0 then
-          v_outcome := 'fed';
-          v_source  := case when v_fridge > 0 then 'fridge' else 'freezer' end;
-        else
-          v_outcome := 'no-stock';
-          v_source  := null;
-        end if;
-
-        insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, source_container, slot_at, processed_by_device, state_revision, origin)
-        values (p_owner, v_day, v_slot, v_outcome, v_source, v_at, p_device, r.revision + 1, 'server')
-        on conflict do nothing;
-        get diagnostics v_ins = row_count;
-
-        if v_ins = 1 then
+      continue when v_at <= v_from or v_at > p_until;
+      v_res := dog_log._run_event(p_owner, v_doc, v_day, v_slot, v_at, v_tz, p_device, r.revision + 1);
+      v_doc := v_res -> 'doc';
+      if (v_res ->> 'ran')::boolean then
+        if (v_res ->> 'meal')::boolean then
           v_meals := v_meals + 1;
-          v_label := case v_slot when 'breakfast' then 'Breakfast' else 'Dinner' end || ' ' || dog_log._fmt_day(v_at, v_tz);
-          if v_outcome = 'fed' then
-            -- client deductPrepared(1): fridge first, remainder from freezer
-            v_doc := jsonb_set(v_doc, '{stock,fridge}', to_jsonb(greatest(v_fridge - least(v_fridge, 1), 0)));
-            if v_fridge < 1 then
-              v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(greatest(v_freezer - least(v_freezer, 1 - v_fridge), 0)));
-            end if;
-            v_fed := v_fed + 1;
-            v_entries := v_entries || (v_label || ': 1 Full Container used (' || v_source || ')');
-          else
-            v_entries := v_entries || (v_label || ': no Full Container available');
-          end if;
+          if (v_res ->> 'fed')::boolean then v_fed := v_fed + 1; end if;
+        elsif (v_res ->> 'want')::numeric > 0 then
+          v_transfers := v_transfers + 1;
+          v_moved := v_moved + (v_res ->> 'moved')::numeric;
         end if;
+        if v_res ->> 'entry' is not null then v_entries := v_entries || (v_res ->> 'entry'); end if;
       end if;
-      v_cursor := v_at;       -- the cursor advances past every due slot, processed or not
+      v_cursor := greatest(v_cursor, v_at);  -- the cursor advances past every due slot, processed or not
       v_changed := true;
     end loop;
   end loop;
@@ -362,6 +394,13 @@ declare
   v_jval     jsonb;
   v_jexp     jsonb;
   v_ok       boolean;
+  v_max      numeric;
+  v_set      jsonb;
+  v_slot     text;
+  v_day      date;
+  v_at       timestamptz;
+  v_res      jsonb;
+  v_late     text;
 begin
   select * into r from dog_log.state where owner_id = p_owner for update;
   v_doc := r.doc;
@@ -492,7 +531,8 @@ begin
       v_ok := false;
       if jsonb_typeof(v_jval) = 'number' then
         v_val := (v_jval #>> '{}')::numeric;
-        if v_val = round(v_val) and v_val between 0 and case v_key when 'fridgeTransferCount' then 100 else 1000000 end then
+        v_max := case v_key when 'fridgeTransferCount' then 100 else 1000000 end;  -- no CASE inside an IF condition
+        if v_val = round(v_val) and v_val between 0 and v_max then
           v_ok := true;
           v_jval := to_jsonb(round(v_val));
         end if;
@@ -511,10 +551,37 @@ begin
       return jsonb_build_object('status', 'conflict', 'detail', jsonb_build_object(
         'field', v_key, 'current', v_jcur, 'attempted', v_jval, 'expected', v_jexp, 'rebased', v_jval));
     end if;
-    v_doc := jsonb_set(v_doc, '{settings}',
-      case when jsonb_typeof(v_doc -> 'settings') = 'object' then v_doc -> 'settings' else '{}'::jsonb end
-      || jsonb_build_object(v_key, v_jval));
+    v_set := case when jsonb_typeof(v_doc -> 'settings') = 'object' then v_doc -> 'settings' else '{}'::jsonb end;
+    if v_key in ('breakfastTime', 'dinnerTime') then
+      -- Breakfast must stay before Dinner. Both are written, so the stored pair is always the effective one.
+      v_set := v_set || jsonb_build_object('breakfastTime', dog_log._setting(v_doc, 'breakfastTime'),
+                                           'dinnerTime', dog_log._setting(v_doc, 'dinnerTime'));
+      v_set := v_set || jsonb_build_object(v_key, v_jval);
+      if (v_set ->> 'breakfastTime') >= (v_set ->> 'dinnerTime') then
+        return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object(
+          'reason', 'Breakfast must be before Dinner', 'field', v_key, 'attempted', v_jval));
+      end if;
+    else
+      v_set := v_set || jsonb_build_object(v_key, v_jval);
+    end if;
+    v_doc := jsonb_set(v_doc, '{settings}', v_set);
     v_detail := jsonb_build_object('field', v_key, 'before', v_jcur, 'after', v_jval);
+    -- A time moved to or before the cursor on the cursor's day would never be reached by the
+    -- walker: if that day has not had this meal/transfer yet, it runs now, exactly once.
+    if v_key in ('breakfastTime', 'dinnerTime', 'fridgeTransferTime') and r.meal_cursor is not null then
+      v_slot := case v_key when 'breakfastTime' then 'breakfast' when 'dinnerTime' then 'dinner' else 'transfer' end;
+      v_day  := (r.meal_cursor at time zone r.time_zone)::date;
+      v_at   := (v_day + dog_log._sched_time(v_doc, v_slot)) at time zone r.time_zone;
+      if v_at <= r.meal_cursor and v_at > coalesce(r.meal_tracking_since, '-infinity'::timestamptz) then
+        v_res := dog_log._run_event(p_owner, v_doc, v_day, v_slot, v_at, r.time_zone,
+                                    left(p_op ->> 'device_id', 100), r.revision + 1);
+        v_doc := v_res -> 'doc';
+        if (v_res ->> 'ran')::boolean then
+          v_late := v_res ->> 'entry';
+          v_detail := v_detail || jsonb_build_object('ran_now', v_slot);
+        end if;
+      end if;
+    end if;
 
   elsif v_type = 'calendar_endpoint' then
     if jsonb_typeof(p_op -> 'value') is distinct from 'string' or jsonb_typeof(p_op -> 'expected') is distinct from 'string'
@@ -600,6 +667,9 @@ begin
   if v_label is not null then
     v_doc := dog_log._history_push(v_doc, p_cc, v_label);
   end if;
+  if v_late is not null then
+    v_doc := dog_log._history_push(v_doc, p_cc, v_late);
+  end if;
   update dog_log.state set doc = v_doc where owner_id = p_owner;
   return jsonb_build_object('status', v_status, 'detail', v_detail);
 end; $$;
@@ -632,10 +702,11 @@ returns jsonb language sql stable set search_path = pg_catalog, pg_temp as $$
 $$;
 
 -- --------------------------------------------------------------------- seeding
--- As before, plus: the device's configured slot times decide which logged slots are
--- imported, transfer entries are imported, and a device that predates the separate
--- transfer ledger (no tracking.transferLedger) had its transfer inside Dinner, so each
--- imported Dinner also closes that day's transfer.
+-- As before, plus the daily transfer. Every meal and transfer the device logged is
+-- imported, so it can never run again even after its configured time moves (slot_at is
+-- capped at the device cursor: the event is already accounted for). A WORK-148 device
+-- logs transfers in tracking.transferLog; an older device had its transfer inside
+-- Dinner (WORK-147), so each imported Dinner also closes that day's transfer.
 create or replace function dog_log.seed_state(p_seed_id uuid, p_doc jsonb, p_device_id text default null, p_client_version integer default 1)
 returns jsonb language plpgsql volatile security definer
 set search_path = pg_catalog, pg_temp set lock_timeout = '3s' as $$
@@ -654,7 +725,10 @@ declare
   v_status   text;
   v_out      text;
   v_at       timestamptz;
-  v_ledger   boolean := coalesce(p_doc #> '{tracking,transferLedger}' = 'true'::jsonb, false);
+  v_ledger   boolean := coalesce(jsonb_typeof(p_doc #> '{tracking,transferLog}') = 'object', false);
+  v_tlog     jsonb := case when jsonb_typeof(p_doc #> '{tracking,transferLog}') = 'object' then p_doc #> '{tracking,transferLog}' else '{}'::jsonb end;
+  v_moved    jsonb;
+  v_today    date := (now() at time zone 'Australia/Melbourne')::date;
 begin
   if v_owner is null then
     raise exception 'not_authenticated' using errcode = '42501';
@@ -685,32 +759,41 @@ begin
   end if;
 
   if v_cursor is not null then
-    -- Import the device's recent meal log so those slots can never be processed again.
+    -- Import the device's recent meal and transfer logs so those events can never run again.
     v_meals := case when jsonb_typeof(p_doc #> '{tracking,mealLog}') = 'object' then p_doc #> '{tracking,mealLog}' else '{}'::jsonb end;
     for v_day in select k from jsonb_object_keys(v_meals) k where k ~ '^\d{4}-\d{2}-\d{2}$' loop
       continue when dog_log._try_ts(v_day) is null;
-      continue when v_day::date < (now() at time zone 'Australia/Melbourne')::date - 13;
+      continue when v_day::date < v_today - 13 or v_day::date > v_today;
       continue when jsonb_typeof(v_meals -> v_day) is distinct from 'object';
-      foreach v_slot in array array['breakfast', 'dinner', 'transfer'] loop
+      foreach v_slot in array array['breakfast', 'dinner'] loop
         v_out := v_meals -> v_day ->> v_slot;
-        if v_slot = 'transfer' then
-          v_out := case when v_out in ('transferred', 'legacy') then 'transferred'
-                        when v_out = 'before-tracking' then v_out end;
-        elsif v_out not in ('fed', 'no-stock', 'before-tracking') then
-          v_out := null;
-        end if;
-        v_at := (v_day::date + dog_log._sched_time(v_doc, v_slot)) at time zone 'Australia/Melbourne';
-        if v_out is not null and v_at <= v_cursor then
+        continue when v_out is null or v_out not in ('fed', 'no-stock', 'before-tracking');
+        v_at := least((v_day::date + dog_log._sched_time(v_doc, v_slot)) at time zone 'Australia/Melbourne', v_cursor);
+        insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, slot_at, processed_by_device, state_revision, origin)
+        values (v_owner, v_day::date, v_slot, v_out, v_at, v_device, 1, 'seed')
+        on conflict do nothing;
+        if v_slot = 'dinner' and not v_ledger and v_out <> 'before-tracking' then
           insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, slot_at, processed_by_device, state_revision, origin)
-          values (v_owner, v_day::date, v_slot, v_out, v_at, v_device, 1, 'seed')
+          values (v_owner, v_day::date, 'transfer', 'transferred', v_at, v_device, 1, 'seed')
           on conflict do nothing;
-          if v_slot = 'dinner' and not v_ledger and v_out <> 'before-tracking' then
-            insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, slot_at, processed_by_device, state_revision, origin)
-            values (v_owner, v_day::date, 'transfer', 'transferred', v_at, v_device, 1, 'seed')
-            on conflict do nothing;
-          end if;
         end if;
       end loop;
+    end loop;
+    for v_day in select k from jsonb_object_keys(v_tlog) k where k ~ '^\d{4}-\d{2}-\d{2}$' loop
+      continue when dog_log._try_ts(v_day) is null;
+      continue when v_day::date < v_today - 13 or v_day::date > v_today;
+      continue when jsonb_typeof(v_tlog -> v_day) is distinct from 'object';
+      v_out := case v_tlog -> v_day ->> 'outcome' when 'processed' then 'transferred' when 'before-tracking' then 'before-tracking' end;
+      continue when v_out is null;
+      v_moved := v_tlog -> v_day -> 'moved';
+      v_at := least((v_day::date + dog_log._sched_time(v_doc, 'transfer')) at time zone 'Australia/Melbourne', v_cursor);
+      insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, freezer_to_fridge_count, slot_at, processed_by_device, state_revision, origin)
+      values (v_owner, v_day::date, 'transfer', v_out,
+              case when v_out = 'transferred' and jsonb_typeof(v_moved) = 'number'
+                        and (v_moved #>> '{}')::numeric between 0 and 100
+                   then round((v_moved #>> '{}')::numeric)::smallint end,
+              v_at, v_device, 1, 'seed')
+      on conflict do nothing;
     end loop;
   else
     -- Device never started meal tracking: initialise exactly as WORK-135's first run.
@@ -726,6 +809,7 @@ end; $$;
 -- ------------------------------------------------------------------ privileges
 revoke all on function
   dog_log._setting(jsonb, text), dog_log._sched_time(jsonb, text), dog_log._norm_doc(jsonb),
+  dog_log._run_event(uuid, jsonb, date, text, timestamptz, text, text, bigint),
   dog_log._process_due_meals(uuid, timestamptz, text), dog_log._apply_op(uuid, jsonb, timestamptz, bigint),
   dog_log._state_json(uuid), dog_log.seed_state(uuid, jsonb, text, integer)
   from public, anon, authenticated, service_role;

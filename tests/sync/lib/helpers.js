@@ -84,4 +84,7 @@ async function seededDevice({ device, backend }, localData = fixture(), opts = {
   return { ...d, owner };
 }
 
-module.exports = { test, expect: base.expect, APP, EMAIL, PASSWORD, fixture, g, signIn, waitSynced, raw, outboxOps, seededDevice, setOffline };
+// WORK-148 Food settings as every normalised cloud document carries them (the legacy defaults).
+const SCHEDULE_DEFAULTS = { maxFreezerContainers: 70, maxFridgeContainers: null, fridgeTransferCount: 2, fridgeTransferTime: '18:00', breakfastTime: '09:00', dinnerTime: '18:00' };
+
+module.exports = { SCHEDULE_DEFAULTS, test, expect: base.expect, APP, EMAIL, PASSWORD, fixture, g, signIn, waitSynced, raw, outboxOps, seededDevice, setOffline };
