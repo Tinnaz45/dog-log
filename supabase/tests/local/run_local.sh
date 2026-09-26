@@ -18,6 +18,8 @@ SUPA="$(cd "$HERE/../.." && pwd)"
 BASE_MIGRATION="$SUPA/migrations/20260924225253_dog_log_create_sync_schema.sql"
 MIGRATION="$SUPA/migrations/20260926005200_dog_log_add_evening_freezer_transfer.sql"
 ROLLBACK="$SUPA/rollbacks/20260926005200_dog_log_add_evening_freezer_transfer.rollback.sql"
+SCHEDULE_MIGRATION="$SUPA/migrations/20260926130000_dog_log_configurable_food_schedule.sql"
+SCHEDULE_ROLLBACK="$SUPA/rollbacks/20260926130000_dog_log_configurable_food_schedule.rollback.sql"
 BASE_ROLLBACK="$SUPA/rollbacks/20260924225253_dog_log_create_sync_schema.rollback.sql"
 PG_BINDIR="${PG_BINDIR:-$(pg_config --bindir)}"
 PORT="${PGTEST_PORT:-55439}"
@@ -67,7 +69,7 @@ EXPECTED=$("${PSQL[@]}" -c "select count(*) from (select (d::date + t) at time z
   from generate_series(((now() - interval '31 hours') at time zone 'Australia/Melbourne')::date, (now() at time zone 'Australia/Melbourne')::date, interval '1 day') d,
   (values (time '09:00'), (time '18:00')) v(t)) s
   where at > (select meal_tracking_since from dog_log.state where owner_id = '$C') and at <= now()")
-EVENTS=$("${PSQL[@]}" -c "select count(*) from dog_log.meal_events where owner_id = '$C' and origin = 'server'")
+EVENTS=$("${PSQL[@]}" -c "select count(*) from dog_log.meal_events where owner_id = '$C' and origin = 'server' and slot <> 'transfer'")
 FRIDGE=$("${PSQL[@]}" -c "select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = '$C'")
 DEVICES=$("${PSQL[@]}" -c "select string_agg(distinct processed_by_device, ',') from dog_log.meal_events where owner_id = '$C' and origin = 'server'")
 [ "$EVENTS" = "$EXPECTED" ] || fail "concurrent meals: $EVENTS events, expected $EXPECTED"
@@ -98,6 +100,10 @@ wait
 [ "$("${PSQL[@]}" -c "select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = '$S'")" = "9" ] || fail "seed race overwrote the first seed"
 pass "seed race: first seeded, second got cloud-exists, nothing overwritten"
 
+echo "== WORK-148 rollback"
+"${PSQL[@]}" -f "$SCHEDULE_ROLLBACK" >/dev/null
+pass "WORK-148 rollback applied before WORK-147 rollback"
+
 echo "== WORK-147 rollback"
 ROWS_BEFORE=$("${PSQL[@]}" -c "select count(*) from dog_log.state")
 "${PSQL[@]}" -f "$ROLLBACK" >/dev/null
@@ -110,6 +116,8 @@ pass "WORK-147 rollback stops future transfers while preserving transfer-aware r
 [ "$("${PSQL[@]}" -c "select position('freezer-to-fridge transfer' in pg_get_functiondef('dog_log._process_due_meals(uuid,timestamptz,text)'::regprocedure))")" != "0" ] || fail "WORK-147 meal function did not reapply"
 [ "$("${PSQL[@]}" -c "select position('transferred_since' in pg_get_functiondef('dog_log._apply_op(uuid,jsonb,timestamptz,bigint)'::regprocedure))")" != "0" ] || fail "WORK-147 operation function did not reapply"
 pass "WORK-147 migration re-applies cleanly"
+"${PSQL[@]}" --single-transaction -f "$SCHEDULE_MIGRATION"
+pass "WORK-148 migration re-applies cleanly"
 
 echo "== base rollback"
 if "${PSQL[@]}" -f "$BASE_ROLLBACK" >/dev/null 2>"$WORK/rb.err"; then fail "base rollback ran while cloud state exists"; fi
