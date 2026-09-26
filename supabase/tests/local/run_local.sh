@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Disposable local test run for the dog_log migration (WORK-136 PR-A).
+# Disposable local test run for Dog Log base sync + WORK-147 evening transfer.
 #
 # Creates a throwaway PostgreSQL cluster in a temp dir, loads the local Supabase
 # stub, applies the migration, runs the SQL suite, then runs the two-session
@@ -15,8 +15,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUPA="$(cd "$HERE/../.." && pwd)"
-MIGRATION="$SUPA/migrations/20260924225253_dog_log_create_sync_schema.sql"
-ROLLBACK="$SUPA/rollbacks/20260924225253_dog_log_create_sync_schema.rollback.sql"
+BASE_MIGRATION="$SUPA/migrations/20260924225253_dog_log_create_sync_schema.sql"
+MIGRATION="$SUPA/migrations/20260926005200_dog_log_add_evening_freezer_transfer.sql"
+ROLLBACK="$SUPA/rollbacks/20260926005200_dog_log_add_evening_freezer_transfer.rollback.sql"
+BASE_ROLLBACK="$SUPA/rollbacks/20260924225253_dog_log_create_sync_schema.rollback.sql"
 PG_BINDIR="${PG_BINDIR:-$(pg_config --bindir)}"
 PORT="${PGTEST_PORT:-55439}"
 
@@ -35,8 +37,9 @@ fail() { echo "FAIL $*" >&2; exit 1; }
 
 echo "== install (clean database)"
 "${PSQL[@]}" -f "$HERE/supabase_stub.sql"
+"${PSQL[@]}" --single-transaction -f "$BASE_MIGRATION"
 "${PSQL[@]}" --single-transaction -f "$MIGRATION"
-pass "migration applied to a clean database"
+pass "base + WORK-147 migrations applied to a clean database"
 
 echo "== SQL suite"
 "${PSQL[@]}" -f "$SUPA/tests/dog_log_sync.sql" 2>&1 | sed -e 's/^psql:[^ ]* NOTICE:  //' | grep -E '^(ok|FAIL|ALL)' || fail "SQL suite"
@@ -95,17 +98,31 @@ wait
 [ "$("${PSQL[@]}" -c "select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = '$S'")" = "9" ] || fail "seed race overwrote the first seed"
 pass "seed race: first seeded, second got cloud-exists, nothing overwritten"
 
-echo "== rollback"
-if "${PSQL[@]}" -f "$ROLLBACK" >/dev/null 2>"$WORK/rb.err"; then fail "rollback ran while cloud state exists"; fi
-grep -q "rollback refused" "$WORK/rb.err" || fail "rollback failed for the wrong reason: $(cat "$WORK/rb.err")"
-[ "$("${PSQL[@]}" -c "select count(*) from dog_log.state")" = "2" ] || fail "refused rollback changed data"
-pass "post-seed rollback refused; data intact"
-"${PSQL[@]}" -c "delete from dog_log.state"   # simulate the supported pre-adoption state (no cloud rows)
+echo "== WORK-147 rollback"
+ROWS_BEFORE=$("${PSQL[@]}" -c "select count(*) from dog_log.state")
 "${PSQL[@]}" -f "$ROLLBACK" >/dev/null
-[ -z "$("${PSQL[@]}" -c "select 1 from pg_namespace where nspname = 'dog_log'")" ] || fail "schema still present after rollback"
-[ -z "$("${PSQL[@]}" -c "select 1 from pg_publication_tables where schemaname = 'dog_log'")" ] || fail "publication still references dog_log"
-pass "pre-adoption rollback removed the schema and the publication entry"
+[ "$("${PSQL[@]}" -c "select count(*) from dog_log.state")" = "$ROWS_BEFORE" ] || fail "WORK-147 rollback changed cloud rows"
+[ "$("${PSQL[@]}" -c "select position('freezer-to-fridge transfer' in pg_get_functiondef('dog_log._process_due_meals(uuid,timestamptz,text)'::regprocedure))")" = "0" ] || fail "WORK-147 rollback did not restore prior meal function"
+[ "$("${PSQL[@]}" -c "select position('transferred_since' in pg_get_functiondef('dog_log._apply_op(uuid,jsonb,timestamptz,bigint)'::regprocedure))")" != "0" ] || fail "WORK-147 rollback lost transfer-aware reconciliation"
+[ "$("${PSQL[@]}" -c "select count(*) from information_schema.columns where table_schema='dog_log' and table_name='meal_events' and column_name='freezer_to_fridge_count'")" = "1" ] || fail "WORK-147 rollback lost transfer ledger"
+pass "WORK-147 rollback stops future transfers while preserving transfer-aware reconciliation and cloud rows"
 "${PSQL[@]}" --single-transaction -f "$MIGRATION"
-pass "migration re-applies cleanly after rollback"
+[ "$("${PSQL[@]}" -c "select position('freezer-to-fridge transfer' in pg_get_functiondef('dog_log._process_due_meals(uuid,timestamptz,text)'::regprocedure))")" != "0" ] || fail "WORK-147 meal function did not reapply"
+[ "$("${PSQL[@]}" -c "select position('transferred_since' in pg_get_functiondef('dog_log._apply_op(uuid,jsonb,timestamptz,bigint)'::regprocedure))")" != "0" ] || fail "WORK-147 operation function did not reapply"
+pass "WORK-147 migration re-applies cleanly"
+
+echo "== base rollback"
+if "${PSQL[@]}" -f "$BASE_ROLLBACK" >/dev/null 2>"$WORK/rb.err"; then fail "base rollback ran while cloud state exists"; fi
+grep -q "rollback refused" "$WORK/rb.err" || fail "base rollback failed for the wrong reason: $(cat "$WORK/rb.err")"
+[ "$("${PSQL[@]}" -c "select count(*) from dog_log.state")" = "2" ] || fail "refused base rollback changed data"
+pass "post-seed base rollback refused; data intact"
+"${PSQL[@]}" -c "delete from dog_log.state"
+"${PSQL[@]}" -f "$BASE_ROLLBACK" >/dev/null
+[ -z "$("${PSQL[@]}" -c "select 1 from pg_namespace where nspname = 'dog_log'")" ] || fail "schema still present after base rollback"
+[ -z "$("${PSQL[@]}" -c "select 1 from pg_publication_tables where schemaname = 'dog_log'")" ] || fail "publication still references dog_log"
+pass "pre-adoption base rollback removed the schema and the publication entry"
+"${PSQL[@]}" --single-transaction -f "$BASE_MIGRATION"
+"${PSQL[@]}" --single-transaction -f "$MIGRATION"
+pass "base + WORK-147 migrations re-apply cleanly after rollback"
 
 echo "ALL LOCAL DOG_LOG DATABASE TESTS PASSED"
