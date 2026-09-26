@@ -1,4 +1,4 @@
-const CACHE = 'dog-log-v11';
+const CACHE = 'dog-log-v12';
 // The vendored library is version-named: a new version gets a new URL, and any change to a precached
 // non-HTML asset must also bump CACHE.
 const ASSETS = ['/', '/index.html', '/manifest.json', '/vendor/supabase-js-2.116.0.min.js'];
