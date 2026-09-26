@@ -5,6 +5,8 @@ This folder holds the Dog Log cloud-sync database: the `dog_log` schema in the s
 | File | Purpose |
 |---|---|
 | `migrations/20260924225253_dog_log_create_sync_schema.sql` | Creates the schema, tables, RLS, RPCs and the realtime publication entry |
+| `migrations/20260926005200_dog_log_add_evening_freezer_transfer.sql` | WORK-147: after Dinner at 18:00, move up to 2 remaining Full Containers from Freezer to Fridge |
+| `rollbacks/20260926005200_dog_log_add_evening_freezer_transfer.rollback.sql` | Stops future transfers by restoring the old meal processor, while retaining the ledger and transfer-aware recount/restore reconciliation |
 | `rollbacks/20260924225253_dog_log_create_sync_schema.rollback.sql` | Pre-adoption rollback only (see below) |
 | `tests/dog_log_sync.sql` | SQL assertion suite. Runs in one transaction that is rolled back |
 | `tests/local/supabase_stub.sql` | Minimal Supabase stand-in for a **disposable local** Postgres only |
@@ -14,7 +16,7 @@ This folder holds the Dog Log cloud-sync database: the `dog_log` schema in the s
 
 - **Tables:**
   - `dog_log.state`: one row per owner, holding `doc jsonb` and a server `revision`.
-  - `dog_log.meal_events`: primary key `(owner_id, meal_date, slot)`, one row per Melbourne-local scheduled meal.
+  - `dog_log.meal_events`: primary key `(owner_id, meal_date, slot)`, one row per Melbourne-local scheduled meal. WORK-147 adds a nullable `freezer_to_fridge_count`: `NULL` means the transfer feature did not run for that meal; Dinner events processed with WORK-147 record `0`, `1`, or `2`.
   - `dog_log.mutations`: idempotency ledger with primary key `(owner_id, mutation_id)`.
   - `dog_log.state_snapshots`: recovery copies; the newest 20 per owner are kept.
 - **Client RPCs** (`EXECUTE` is granted to `authenticated` only):

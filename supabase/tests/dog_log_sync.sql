@@ -351,13 +351,16 @@ select pg_temp.ok(dog_log._slot_at('2026-04-05', 'breakfast', 'Australia/Melbour
                   '17 slot times correct across DST end');
 select pg_temp.ok((select string_agg(slot || ':' || outcome || ':' || coalesce(source_container, '-'), ',' order by slot_at)
                      from dog_log.meal_events where owner_id = :E and origin = 'server')
-                  = 'dinner:fed:fridge,breakfast:fed:fridge,dinner:fed:fridge,breakfast:fed:freezer,dinner:fed:freezer,breakfast:no-stock:-',
-                  '18 fridge first, then freezer, then no-stock');
+                  = 'dinner:fed:fridge,breakfast:fed:fridge,dinner:fed:fridge,breakfast:fed:fridge,dinner:fed:fridge,breakfast:no-stock:-',
+                  '18 dinner transfer replenishes fridge for later meals; then no-stock');
 select pg_temp.ok((select (doc #>> '{stock,fridge}')::int + (doc #>> '{stock,freezer}')::int from dog_log.state where owner_id = :E) = 0,
                   '18 exactly one Full Container per fed slot');
 select pg_temp.ok((select doc #>> '{history,0,action}' from dog_log.state where owner_id = :E) = 'Breakfast Mon 6 Oct 2025: no Full Container available'
-              and (select doc #>> '{history,1,action}' from dog_log.state where owner_id = :E) = 'Dinner Sun 5 Oct 2025: 1 Full Container used (freezer)',
-                  '18 history text matches WORK-135 wording (year shown for a past year)');
+              and (select doc #>> '{history,1,action}' from dog_log.state where owner_id = :E) = '18:00 freezer-to-fridge transfer Sun 5 Oct 2025: no Full Containers available in Freezer'
+              and (select doc #>> '{history,2,action}' from dog_log.state where owner_id = :E) = 'Dinner Sun 5 Oct 2025: 1 Full Container used (fridge)'
+              and exists (select 1 from jsonb_array_elements((select doc -> 'history' from dog_log.state where owner_id = :E)) h
+                           where h ->> 'action' = '18:00 freezer-to-fridge transfer Fri 3 Oct 2025: 2 Full Containers moved from Freezer to Fridge'),
+                  '18 history records dinner then the automatic freezer-to-fridge transfer');
 select pg_temp.ok(not dog_log._process_due_meals(:E, timestamptz '2025-10-06 12:00 Australia/Melbourne', 'retry'), '19 retrying the same window reports no change');
 select pg_temp.ok((select count(*) from dog_log.meal_events where owner_id = :E and origin = 'server') = 6, '19 retrying the same window adds no events');
 do $$ begin
@@ -369,9 +372,69 @@ end $$;
 select pg_temp.ok((select count(distinct slot) from dog_log.meal_events where owner_id = :E and meal_date = '2025-10-05') = 2,
                   '20 breakfast and dinner of the same day are independent identities');
 select pg_temp.ok(dog_log._process_due_meals(:E, timestamptz '2025-10-10 12:00 Australia/Melbourne', 'test'), '20 long catch-up runs');
-select pg_temp.ok((select doc #>> '{history,0,action}' from dog_log.state where owner_id = :E) = 'Scheduled meals caught up: 8 meals, 0 Full Containers used',
-                  '20 more than 6 slots collapse into one summary line');
-do $$ begin
+select pg_temp.ok((select doc #>> '{history,0,action}' from dog_log.state where owner_id = :E) = 'Scheduled meals caught up: 8 meals, 0 Full Containers used'
+              and (select doc #>> '{history,1,action}' from dog_log.state where owner_id = :E) = 'Automatic 18:00 freezer-to-fridge transfers caught up: 0 Full Containers moved across 4 dinner slots',
+                  '20 long catch-up keeps the meal summary and records transfer catch-up');
+-- WORK-147 fixed dinner edges: dinner is consumed first, then 0/1/2 containers move.
+update dog_log.state
+   set doc = jsonb_set(jsonb_set(doc, '{stock,fridge}', '0'::jsonb), '{stock,freezer}', '3'::jsonb),
+       meal_cursor = timestamptz '2026-09-20 17:59 Australia/Melbourne'
+ where owner_id = :E;
+delete from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-20';
+select pg_temp.ok(dog_log._process_due_meals(:E, timestamptz '2026-09-20 18:01 Australia/Melbourne', 'edge-2'), '20 2-container dinner transfer runs');
+select pg_temp.ok((select source_container from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-20' and slot = 'dinner') = 'freezer'
+              and (select freezer_to_fridge_count from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-20' and slot = 'dinner') = 2
+              and (select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = :E) = 2
+              and (select (doc #>> '{stock,freezer}')::int from dog_log.state where owner_id = :E) = 0,
+                  '20 dinner consumes freezer first, then exactly 2 remaining containers move to fridge');
+select pg_temp.ok(not dog_log._process_due_meals(:E, timestamptz '2026-09-20 18:01 Australia/Melbourne', 'edge-2-retry')
+              and (select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = :E) = 2,
+                  '20 retry cannot double-run the 18:00 transfer');
+-- A recount made immediately before Dinner must replay both the meal and the transfer.
+select dog_log._apply_op(:E, jsonb_build_object('type','set','key','freezer','value',4,'expected',3),
+  timestamptz '2026-09-20 17:59 Australia/Melbourne', (select revision from dog_log.state where owner_id = :E)) as r_freezer_recount \gset
+select pg_temp.ok((:'r_freezer_recount'::jsonb ->> 'status') = 'applied'
+              and (:'r_freezer_recount'::jsonb #>> '{detail,transferred_since}')::int = 2
+              and (select (doc #>> '{stock,freezer}')::int from dog_log.state where owner_id = :E) = 1,
+                  '20 freezer recount replays dinner use plus 2-container transfer');
+
+update dog_log.state
+   set doc = jsonb_set(jsonb_set(doc, '{stock,fridge}', '0'::jsonb), '{stock,freezer}', '2'::jsonb),
+       meal_cursor = timestamptz '2026-09-21 17:59 Australia/Melbourne'
+ where owner_id = :E;
+delete from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-21';
+select pg_temp.ok(dog_log._process_due_meals(:E, timestamptz '2026-09-21 18:01 Australia/Melbourne', 'edge-1'), '20 1-container dinner transfer runs');
+select pg_temp.ok((select freezer_to_fridge_count from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-21' and slot = 'dinner') = 1
+              and (select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = :E) = 1
+              and (select (doc #>> '{stock,freezer}')::int from dog_log.state where owner_id = :E) = 0,
+                  '20 only 1 remaining freezer container moves when dinner leaves one');
+-- Restoring a backup from just before Dinner replays dinner first, then its recorded transfer.
+select dog_log._apply_op(:E, jsonb_build_object(
+  'type','replace_state','reason','restore-backup',
+  'expected_revision',(select revision from dog_log.state where owner_id = :E),
+  'doc','{"stock":{"fridge":0,"freezer":2}}'::jsonb,
+  'subtract_meals_since',true,'backup_created_at','2026-09-21 17:59 Australia/Melbourne'),
+  now(), (select revision from dog_log.state where owner_id = :E)) as r_transfer_restore \gset
+select pg_temp.ok((:'r_transfer_restore'::jsonb ->> 'status') = 'applied'
+              and (:'r_transfer_restore'::jsonb #>> '{detail,meals_subtracted}')::int = 1
+              and (:'r_transfer_restore'::jsonb #>> '{detail,containers_transferred}')::int = 1
+              and (select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = :E) = 1
+              and (select (doc #>> '{stock,freezer}')::int from dog_log.state where owner_id = :E) = 0,
+                  '20 backup restore replays the recorded freezer-to-fridge transfer');
+
+update dog_log.state
+   set doc = jsonb_set(jsonb_set(doc, '{stock,fridge}', '1'::jsonb), '{stock,freezer}', '0'::jsonb),
+       meal_cursor = timestamptz '2026-09-22 17:59 Australia/Melbourne'
+ where owner_id = :E;
+delete from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-22';
+select pg_temp.ok(dog_log._process_due_meals(:E, timestamptz '2026-09-22 18:01 Australia/Melbourne', 'edge-0'), '20 0-container dinner transfer runs');
+select pg_temp.ok((select freezer_to_fridge_count from dog_log.meal_events where owner_id = :E and meal_date = '2026-09-22' and slot = 'dinner') = 0
+              and (select (doc #>> '{stock,fridge}')::int from dog_log.state where owner_id = :E) = 0
+              and (select (doc #>> '{stock,freezer}')::int from dog_log.state where owner_id = :E) = 0
+              and (select doc #>> '{history,0,action}' from dog_log.state where owner_id = :E) = '18:00 freezer-to-fridge transfer Tue 22 Sept 2026: no Full Containers available in Freezer',
+                  '20 zero freezer stock is safe and clearly recorded');
+
+do  begin
   perform dog_log._process_due_meals('eeeeeeee-0000-4000-8000-00000000000e', now() + interval '1 minute', 'x');
   raise exception 'FAIL: future processing allowed';
 exception when invalid_parameter_value then raise notice 'ok   20 processing a future time is refused';

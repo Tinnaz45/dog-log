@@ -6,7 +6,10 @@ const os = require('os');
 const path = require('path');
 
 const SUPA = path.resolve(__dirname, '../../../supabase');
-const MIGRATION = path.join(SUPA, 'migrations/20260924225253_dog_log_create_sync_schema.sql');
+const MIGRATIONS = [
+  path.join(SUPA, 'migrations/20260924225253_dog_log_create_sync_schema.sql'),
+  path.join(SUPA, 'migrations/20260926005200_dog_log_add_evening_freezer_transfer.sql'),
+];
 const STUB = path.join(SUPA, 'tests/local/supabase_stub.sql');
 
 function binDir() {
@@ -32,12 +35,12 @@ function start(port) {
   const bin = binDir();
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doglog-pg-'));
   fs.chmodSync(work, 0o777);
-  for (const f of [STUB, MIGRATION]) { fs.copyFileSync(f, path.join(work, path.basename(f))); fs.chmodSync(path.join(work, path.basename(f)), 0o644); }
+  for (const f of [STUB, ...MIGRATIONS]) { fs.copyFileSync(f, path.join(work, path.basename(f))); fs.chmodSync(path.join(work, path.basename(f)), 0o644); }
   run(path.join(bin, 'initdb'), ['-D', path.join(work, 'data'), '-U', 'postgres', '--auth=trust', '-E', 'UTF8']);
   run(path.join(bin, 'pg_ctl'), ['-D', path.join(work, 'data'), '-o', `-p ${port} -k ${work} -c listen_addresses=''`, '-l', path.join(work, 'log'), '-w', 'start']);
   const psql = (file) => run(path.join(bin, 'psql'), ['-h', work, '-p', String(port), '-U', 'postgres', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-f', path.join(work, path.basename(file))]);
   psql(STUB);
-  psql(MIGRATION);
+  for (const migration of MIGRATIONS) psql(migration);
   return {
     host: work,
     port,
