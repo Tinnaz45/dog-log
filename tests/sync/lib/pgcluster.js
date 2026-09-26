@@ -9,6 +9,7 @@ const SUPA = path.resolve(__dirname, '../../../supabase');
 const MIGRATIONS = [
   path.join(SUPA, 'migrations/20260924225253_dog_log_create_sync_schema.sql'),
   path.join(SUPA, 'migrations/20260926005200_dog_log_add_evening_freezer_transfer.sql'),
+  path.join(SUPA, 'migrations/20260926130000_dog_log_configurable_food_schedule.sql'),
 ];
 const STUB = path.join(SUPA, 'tests/local/supabase_stub.sql');
 

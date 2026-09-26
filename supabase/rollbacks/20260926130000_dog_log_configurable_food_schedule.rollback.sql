@@ -1,0 +1,583 @@
+-- =============================================================================
+-- WORK-148 rollback: return to the WORK-147 fixed schedule (Breakfast 09:00,
+-- Dinner 18:00, up to 2 Full Containers moved Freezer to Fridge inside Dinner).
+--
+-- Restores, verbatim, the function bodies that were live before WORK-148:
+--   _norm_doc, _state_json, seed_state        (20260924225253 base migration)
+--   _process_due_meals, _apply_op             (20260926005200 WORK-147 migration)
+-- and drops the WORK-148 helpers _setting and _sched_time.
+--
+-- Kept on purpose (data-preserving, like the WORK-147 rollback):
+--   * meal_events rows with slot = 'transfer' and the widened checks that allow
+--     them. Narrowing the checks would fail once such rows exist and deleting them
+--     would lose the transfer ledger. The WORK-147 functions ignore these rows for
+--     scheduling, and their recount/restore reconciliation already counts every
+--     row's freezer_to_fridge_count, so stock reconciliation stays correct.
+--   * WORK-148 keys inside state.doc.settings (inert for the WORK-147 functions).
+--
+-- Operator notes:
+--   * Revert the WORK-148 client first (or together): after this rollback the server
+--     rejects settings operations for the new fields ('invalid settings'), which a
+--     WORK-148 client would show under Needs review.
+--   * If a configured transfer already ran earlier today, the restored WORK-147
+--     Dinner will transfer again at 18:00 that day (at most once).
+-- =============================================================================
+-- Base _norm_doc (20260924225253).
+-- Convert (never reject) a client doc into the canonical server shape (R10).
+-- Strips every device-local calendar credential/status field (section 15).
+create or replace function dog_log._norm_doc(p jsonb)
+returns jsonb language plpgsql stable set search_path = pg_catalog, pg_temp as $$
+declare
+  s        jsonb := case when jsonb_typeof(p -> 'stock') = 'object' then p -> 'stock' else '{}'::jsonb end;
+  st       jsonb := case when jsonb_typeof(p -> 'settings') = 'object' then p -> 'settings' else '{}'::jsonb end;
+  tr       jsonb := case when jsonb_typeof(p -> 'tracking') = 'object' then p -> 'tracking' else '{}'::jsonb end;
+  cal      jsonb := case when jsonb_typeof(p -> 'calendar') = 'object' then p -> 'calendar' else '{}'::jsonb end;
+  necks    jsonb := coalesce(nullif(s -> 'neckPackets', 'null'::jsonb), s -> 'neckBags');
+  batches  jsonb;
+  history  jsonb;
+  inc      numeric;
+  endpoint text;
+begin
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'at',              case when jsonb_typeof(b -> 'at') = 'string' then left(b ->> 'at', 40) else null end,
+           'containers',      dog_log._kg(dog_log._num(b -> 'containers')),
+           'minceUsedKg',     dog_log._kg(dog_log._num(b -> 'minceUsedKg')),
+           'neckPacketsUsed', dog_log._kg(dog_log._num(b -> 'neckPacketsUsed')),
+           'minceLeftKg',     dog_log._kg(dog_log._num(b -> 'minceLeftKg')),
+           'neckPacketsLeft', dog_log._kg(dog_log._num(b -> 'neckPacketsLeft'))
+         ) order by ord), '[]'::jsonb)
+    into batches
+    from (select b, ord from jsonb_array_elements(case when jsonb_typeof(p -> 'batches') = 'array' then p -> 'batches' else '[]'::jsonb end)
+                 with ordinality as t(b, ord)
+           where jsonb_typeof(b) = 'object' order by ord limit 50) x;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'at',     case when jsonb_typeof(h -> 'at') = 'string' then left(h ->> 'at', 40) else null end,
+           'action', left(h ->> 'action', 500)
+         ) order by ord), '[]'::jsonb)
+    into history
+    from (select h, ord from jsonb_array_elements(case when jsonb_typeof(p -> 'history') = 'array' then p -> 'history' else '[]'::jsonb end)
+                 with ordinality as t(h, ord)
+           where jsonb_typeof(h) = 'object' and jsonb_typeof(h -> 'action') = 'string' order by ord limit 150) x;
+
+  inc := dog_log._kg(dog_log._num(st -> 'mincePurchaseIncrementKg', 0.5));
+  if inc = 0 then inc := 0.5; end if;          -- client: Number(x)||.5
+  inc := least(greatest(0.1, inc), 1000);      -- client: Math.max(.1, ...); bounded
+  endpoint := case when jsonb_typeof(cal -> 'endpoint') = 'string'
+                     and (cal ->> 'endpoint') ~ '^https://script\.google\.com/macros/s/[^/\s]+/exec$'
+                     and length(cal ->> 'endpoint') <= 500
+                   then cal ->> 'endpoint' else '' end;
+
+  return jsonb_build_object(
+    'stock', jsonb_build_object(
+      'fridge',         dog_log._count(dog_log._num(s -> 'fridge')),
+      'freezer',        dog_log._count(dog_log._num(s -> 'freezer')),
+      'minceKg',        dog_log._kg(dog_log._num(s -> 'minceKg')),
+      'neckPackets',    dog_log._count(dog_log._num(necks)),
+      'necksOnly',      dog_log._count(dog_log._num(s -> 'necksOnly')),
+      'minceOnly',      dog_log._count(dog_log._num(s -> 'minceOnly')),
+      'lykaPackets',    dog_log._count(dog_log._num(s -> 'lykaPackets')),
+      'scratchPackets', dog_log._count(dog_log._num(s -> 'scratchPackets'))),
+    'settings', jsonb_build_object(
+      'totalContainers',          round(least(greatest(dog_log._num(st -> 'totalContainers', 40), 0), 1000000), 2),
+      'mincePurchaseIncrementKg', inc),
+    'batches',  batches,
+    'history',  history,
+    'calendar', jsonb_build_object('endpoint', endpoint),
+    'legacy',   jsonb_build_object(
+      'containersPerDay', case when jsonb_typeof(st -> 'containersPerDay') = 'number' then to_jsonb(dog_log._num(st -> 'containersPerDay')) else '2'::jsonb end,
+      'lastAutoDate',     case when jsonb_typeof(tr -> 'lastAutoDate') = 'string' then to_jsonb(left(tr ->> 'lastAutoDate', 40)) else 'null'::jsonb end));
+end $$;
+
+-- WORK-147 _process_due_meals and _apply_op (20260926005200).
+create or replace function dog_log._process_due_meals(p_owner uuid, p_until timestamptz, p_device text)
+returns boolean language plpgsql volatile set search_path = pg_catalog, pg_temp as $$
+declare
+  r         dog_log.state%rowtype;
+  v_doc     jsonb;
+  v_tz      text;
+  v_cursor  timestamptz;
+  v_day     date;
+  v_slot    text;
+  v_label   text;
+  v_at      timestamptz;
+  v_fridge  numeric;
+  v_freezer numeric;
+  v_outcome text;
+  v_source  text;
+  v_ins     int;
+  v_entries text[] := '{}';
+  v_fed     int := 0;
+  v_meals   int := 0;
+  v_dinners int := 0;
+  v_move    numeric := 0;
+  v_moved   numeric := 0;
+  v_transfer_label text;
+  v_changed boolean := false;
+begin
+  if (select auth.uid()) is not null and (select auth.uid()) <> p_owner then
+    raise exception 'owner_mismatch' using errcode = '42501';
+  end if;
+  if p_until > now() then
+    raise exception 'meal processing time is in the future' using errcode = '22023';
+  end if;
+
+  select * into r from dog_log.state where owner_id = p_owner for update;
+  if not found then return false; end if;
+  v_doc := r.doc; v_tz := r.time_zone; v_cursor := r.meal_cursor;
+
+  -- First run (WORK-135): start tracking now; today's already-passed slots are 'before-tracking'.
+  if v_cursor is null then
+    v_day := (p_until at time zone v_tz)::date;
+    foreach v_slot in array array['breakfast', 'dinner'] loop
+      v_at := dog_log._slot_at(v_day, v_slot, v_tz);
+      if v_at <= p_until then
+        insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, slot_at, processed_by_device, state_revision, origin)
+        values (p_owner, v_day, v_slot, 'before-tracking', v_at, p_device, r.revision + 1, 'server')
+        on conflict do nothing;
+      end if;
+    end loop;
+    v_doc := dog_log._history_push(v_doc, now(),
+      'Meal schedule started: Breakfast 09:00 and Dinner 18:00 each use 1 Full Container. Existing stock kept as recorded.');
+    update dog_log.state
+       set doc = v_doc, meal_cursor = p_until, meal_tracking_since = coalesce(meal_tracking_since, p_until)
+     where owner_id = p_owner;
+    return true;
+  end if;
+
+  if p_until <= v_cursor then return false; end if;
+  -- Bound the catch-up walk (at most ~800 slots) so a corrupt or ancient cursor can
+  -- never make every sync time out; older slots are beyond meal_events retention anyway.
+  v_cursor := greatest(v_cursor, p_until - interval '400 days');
+
+  for v_day in select d::date from generate_series((v_cursor at time zone v_tz)::date, (p_until at time zone v_tz)::date, interval '1 day') d loop
+    foreach v_slot in array array['breakfast', 'dinner'] loop
+      v_at := dog_log._slot_at(v_day, v_slot, v_tz);
+      continue when v_at <= v_cursor or v_at > p_until;
+
+      v_fridge  := coalesce((v_doc #>> '{stock,fridge}')::numeric, 0);
+      v_freezer := coalesce((v_doc #>> '{stock,freezer}')::numeric, 0);
+      if v_fridge + v_freezer > 0 then
+        v_outcome := 'fed';
+        v_source  := case when v_fridge > 0 then 'fridge' else 'freezer' end;
+      else
+        v_outcome := 'no-stock';
+        v_source  := null;
+      end if;
+
+      v_move := 0;
+      if v_slot = 'dinner' then
+        v_move := least(greatest(v_freezer - case when v_outcome = 'fed' and v_source = 'freezer' then 1 else 0 end, 0), 2);
+      end if;
+
+      insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, source_container, freezer_to_fridge_count, slot_at, processed_by_device, state_revision, origin)
+      values (p_owner, v_day, v_slot, v_outcome, v_source, case when v_slot = 'dinner' then v_move::smallint end, v_at, p_device, r.revision + 1, 'server')
+      on conflict do nothing;
+      get diagnostics v_ins = row_count;
+
+      if v_ins = 1 then
+        v_meals := v_meals + 1;
+        v_label := case v_slot when 'breakfast' then 'Breakfast' else 'Dinner' end || ' ' || dog_log._fmt_day(v_at, v_tz);
+        if v_outcome = 'fed' then
+          -- client deductPrepared(1): fridge first, remainder from freezer
+          v_doc := jsonb_set(v_doc, '{stock,fridge}', to_jsonb(greatest(v_fridge - least(v_fridge, 1), 0)));
+          if v_fridge < 1 then
+            v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(greatest(v_freezer - least(v_freezer, 1 - v_fridge), 0)));
+          end if;
+          v_fed := v_fed + 1;
+          v_entries := v_entries || (v_label || ': 1 Full Container used (' || v_source || ')');
+        else
+          v_entries := v_entries || (v_label || ': no Full Container available');
+        end if;
+
+        -- WORK-147: dinner is consumed first. Only then prepare tomorrow's food by
+        -- moving up to two remaining Full Containers from Freezer to Fridge.
+        if v_slot = 'dinner' then
+          v_dinners := v_dinners + 1;
+          v_fridge  := coalesce((v_doc #>> '{stock,fridge}')::numeric, 0);
+          v_freezer := coalesce((v_doc #>> '{stock,freezer}')::numeric, 0);
+          if v_move > 0 then
+            v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(v_freezer - v_move));
+            v_doc := jsonb_set(v_doc, '{stock,fridge}',  to_jsonb(v_fridge + v_move));
+          end if;
+          v_moved := v_moved + v_move;
+          v_transfer_label := '18:00 freezer-to-fridge transfer ' || dog_log._fmt_day(v_at, v_tz);
+          if v_move = 0 then
+            v_entries := v_entries || (v_transfer_label || ': no Full Containers available in Freezer');
+          elsif v_move = 1 then
+            v_entries := v_entries || (v_transfer_label || ': 1 Full Container moved from Freezer to Fridge');
+          else
+            v_entries := v_entries || (v_transfer_label || ': ' || v_move::bigint || ' Full Containers moved from Freezer to Fridge');
+          end if;
+        end if;
+      end if;
+      v_cursor := v_at;       -- the cursor advances past every due slot, fed or not
+      v_changed := true;
+    end loop;
+  end loop;
+
+  if v_meals > 6 then
+    -- Push transfer summary first so the existing meal catch-up summary remains the
+    -- newest history entry, preserving the established history contract.
+    if v_dinners > 0 then
+      v_doc := dog_log._history_push(v_doc, now(),
+        'Automatic 18:00 freezer-to-fridge transfers caught up: ' || v_moved::bigint ||
+        ' Full Containers moved across ' || v_dinners || ' dinner slots');
+    end if;
+    v_doc := dog_log._history_push(v_doc, now(),
+      'Scheduled meals caught up: ' || v_meals || ' meals, ' || v_fed || ' Full Containers used');
+  else
+    for i in 1 .. coalesce(cardinality(v_entries), 0) loop
+      v_doc := dog_log._history_push(v_doc, now(), v_entries[i]);
+    end loop;
+  end if;
+
+  if v_changed then
+    update dog_log.state set doc = v_doc, meal_cursor = v_cursor where owner_id = p_owner;
+  end if;
+  return v_changed;
+end $$;
+
+create or replace function dog_log._apply_op(p_owner uuid, p_op jsonb, p_cc timestamptz, p_start_revision bigint)
+returns jsonb language plpgsql volatile set search_path = pg_catalog, pg_temp as $$
+declare
+  r          dog_log.state%rowtype;
+  v_doc      jsonb;
+  v_type     text := p_op ->> 'type';
+  v_key      text;
+  v_label    text := case when jsonb_typeof(p_op -> 'label') = 'string' and length(p_op ->> 'label') > 0 then left(p_op ->> 'label', 500) end;
+  v_cur      numeric;
+  v_val      numeric;
+  v_exp      numeric;
+  v_delta    numeric;
+  v_new      numeric;
+  v_fed      numeric;
+  v_transferred numeric := 0;
+  v_effect   numeric := 0;
+  v_move     numeric := 0;
+  v_event    record;
+  v_status   text := 'applied';
+  v_detail   jsonb := '{}'::jsonb;
+  v_conf     jsonb := '[]'::jsonb;
+  v_dest     text;
+  v_n        int;
+  v_text     text;
+  v_before   timestamptz;
+  v_snapshot text;
+begin
+  select * into r from dog_log.state where owner_id = p_owner for update;
+  v_doc := r.doc;
+
+  if v_type = 'adjust' then
+    v_key := p_op ->> 'key';
+    if not dog_log._is_stock_key(v_key) or jsonb_typeof(p_op -> 'delta') is distinct from 'number' then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid adjust'));
+    end if;
+    v_delta := (p_op ->> 'delta')::numeric;
+    if abs(v_delta) > 1000000 then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'delta out of range'));
+    end if;
+    if dog_log._is_count_key(v_key) and v_delta <> round(v_delta) then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'count delta must be an integer'));
+    end if;
+    v_cur := coalesce((v_doc #>> array['stock', v_key])::numeric, 0);
+    v_new := dog_log._stock_val(v_key, v_cur + v_delta);
+    if v_cur + v_delta < 0 then v_status := 'applied-clamped'; end if;
+    v_doc := jsonb_set(v_doc, array['stock', v_key], to_jsonb(v_new));
+    v_detail := jsonb_build_object('key', v_key, 'before', v_cur, 'after', v_new);
+
+  elsif v_type = 'set' then
+    -- Conditional recount rebased to its own time (R2).
+    v_key := p_op ->> 'key';
+    if not dog_log._is_stock_key(v_key) or jsonb_typeof(p_op -> 'value') is distinct from 'number' or jsonb_typeof(p_op -> 'expected') is distinct from 'number' then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid set'));
+    end if;
+    v_cur := coalesce((v_doc #>> array['stock', v_key])::numeric, 0);
+    v_val := dog_log._stock_val(v_key, (p_op ->> 'value')::numeric);
+    v_exp := dog_log._stock_val(v_key, (p_op ->> 'expected')::numeric);
+    v_fed := 0;
+    v_transferred := 0;
+    v_effect := 0;
+    if v_key in ('fridge', 'freezer') then
+      select count(*) filter (where outcome = 'fed' and source_container = v_key),
+             coalesce(sum(freezer_to_fridge_count), 0)
+        into v_fed, v_transferred
+        from dog_log.meal_events
+       where owner_id = p_owner and slot_at > p_cc;
+      -- Net server-side stock effect since the recount: meals consume from their
+      -- recorded source; WORK-147 dinner transfers add to fridge and subtract from freezer.
+      v_effect := case when v_key = 'fridge'
+                       then -v_fed + v_transferred
+                       else -v_fed - v_transferred end;
+    end if;
+    if dog_log._stock_val(v_key, v_cur - v_effect) <> v_exp then
+      return jsonb_build_object('status', 'conflict', 'detail', jsonb_build_object(
+        'key', v_key, 'current', v_cur, 'attempted', v_val, 'expected', v_exp,
+        'rebased', dog_log._stock_val(v_key, v_val + v_effect),
+        'fed_since', v_fed, 'transferred_since', v_transferred));
+    end if;
+    v_new := dog_log._stock_val(v_key, v_val + v_effect);
+    if v_val + v_effect < 0 then v_status := 'applied-clamped'; end if;
+    v_doc := jsonb_set(v_doc, array['stock', v_key], to_jsonb(v_new));
+    v_detail := jsonb_build_object('key', v_key, 'before', v_cur, 'after', v_new,
+                                   'fed_since', v_fed, 'transferred_since', v_transferred);
+
+  elsif v_type = 'prep_batch' then
+    v_dest := p_op ->> 'destination';
+    if coalesce(v_dest, '') not in ('fridge', 'freezer') or jsonb_typeof(p_op -> 'containers') is distinct from 'number'
+       or (p_op ->> 'containers')::numeric <= 0 or (p_op ->> 'containers')::numeric <> round((p_op ->> 'containers')::numeric)
+       or jsonb_typeof(p_op -> 'batch') is distinct from 'object' then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid prep_batch'));
+    end if;
+    -- The batch and its containers are additive facts: always applied.
+    v_doc := jsonb_set(v_doc, '{batches}',
+      (select coalesce(jsonb_agg(e order by ord), '[]'::jsonb) from (
+         select e, ord from (
+           select (dog_log._norm_doc(jsonb_build_object('batches', jsonb_build_array(p_op -> 'batch'))) -> 'batches' -> 0) as e, 0::bigint as ord
+           union all
+           select b.e, b.ord from jsonb_array_elements(v_doc -> 'batches') with ordinality as b(e, ord)
+         ) x order by ord limit 50) y));
+    v_cur := coalesce((v_doc #>> array['stock', v_dest])::numeric, 0);
+    v_doc := jsonb_set(v_doc, array['stock', v_dest], to_jsonb(dog_log._count(v_cur + (p_op ->> 'containers')::numeric)));
+    -- Ingredient left-overs are conditional sets, each able to conflict independently.
+    foreach v_key in array array['minceKg', 'neckPackets'] loop
+      v_text := case v_key when 'minceKg' then 'minceLeftKg' else 'neckPacketsLeft' end;
+      if jsonb_typeof(p_op -> v_text) = 'number' then
+        v_cur := coalesce((v_doc #>> array['stock', v_key])::numeric, 0);
+        v_val := dog_log._stock_val(v_key, (p_op ->> v_text)::numeric);
+        v_exp := case when jsonb_typeof(p_op -> case v_key when 'minceKg' then 'expectedMinceKg' else 'expectedNeckPackets' end) = 'number'
+                      then dog_log._stock_val(v_key, (p_op ->> case v_key when 'minceKg' then 'expectedMinceKg' else 'expectedNeckPackets' end)::numeric) end;
+        if v_exp is not null and v_cur = v_exp then
+          v_doc := jsonb_set(v_doc, array['stock', v_key], to_jsonb(v_val));
+        else
+          v_conf := v_conf || jsonb_build_object('key', v_key, 'current', v_cur, 'attempted', v_val, 'expected', v_exp, 'rebased', v_val);
+        end if;
+      end if;
+    end loop;
+    v_detail := jsonb_build_object('destination', v_dest, 'containers', (p_op ->> 'containers')::numeric);
+    if jsonb_array_length(v_conf) > 0 then
+      v_status := 'conflict';
+      v_detail := v_detail || jsonb_build_object('partial', true, 'conflicts', v_conf);
+    end if;
+
+  elsif v_type = 'settings' then
+    v_key := p_op ->> 'field';
+    if coalesce(v_key, '') not in ('totalContainers', 'mincePurchaseIncrementKg')
+       or jsonb_typeof(p_op -> 'value') is distinct from 'number' or jsonb_typeof(p_op -> 'expected') is distinct from 'number' then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid settings'));
+    end if;
+    v_cur := coalesce((v_doc #>> array['settings', v_key])::numeric, 0);
+    if v_key = 'totalContainers' then
+      v_val := round(greatest((p_op ->> 'value')::numeric, 0), 2);
+      v_exp := round(greatest((p_op ->> 'expected')::numeric, 0), 2);
+    else
+      v_val := greatest(0.1, dog_log._kg((p_op ->> 'value')::numeric));
+      v_exp := dog_log._kg((p_op ->> 'expected')::numeric);
+    end if;
+    if v_cur <> v_exp then
+      return jsonb_build_object('status', 'conflict', 'detail', jsonb_build_object(
+        'field', v_key, 'current', v_cur, 'attempted', v_val, 'expected', v_exp, 'rebased', v_val));
+    end if;
+    v_doc := jsonb_set(v_doc, array['settings', v_key], to_jsonb(v_val));
+    v_detail := jsonb_build_object('field', v_key, 'before', v_cur, 'after', v_val);
+
+  elsif v_type = 'calendar_endpoint' then
+    if jsonb_typeof(p_op -> 'value') is distinct from 'string' or jsonb_typeof(p_op -> 'expected') is distinct from 'string'
+       or not ((p_op ->> 'value') = '' or (p_op ->> 'value') ~ '^https://script\.google\.com/macros/s/[^/\s]+/exec$') then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid calendar_endpoint'));
+    end if;
+    if coalesce(v_doc #>> '{calendar,endpoint}', '') <> (p_op ->> 'expected') then
+      return jsonb_build_object('status', 'conflict', 'detail', jsonb_build_object(
+        'field', 'calendar.endpoint', 'current', coalesce(v_doc #>> '{calendar,endpoint}', ''),
+        'attempted', p_op ->> 'value', 'expected', p_op ->> 'expected'));
+    end if;
+    v_doc := jsonb_set(v_doc, '{calendar}', jsonb_build_object('endpoint', p_op ->> 'value'));
+
+  elsif v_type = 'clear_history' then
+    v_before := dog_log._try_ts(p_op ->> 'before');
+    if v_before is null then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid clear_history'));
+    end if;
+    -- Only entries at or before the clear time go; entries synced later from another device survive.
+    v_doc := jsonb_set(v_doc, '{history}',
+      (select coalesce(jsonb_agg(h.e order by h.ord), '[]'::jsonb)
+         from jsonb_array_elements(v_doc -> 'history') with ordinality as h(e, ord)
+        where dog_log._try_ts(h.e ->> 'at') > v_before));
+
+  elsif v_type = 'replace_state' then
+    -- Explicit restore only; revision-checked against the revision the client observed.
+    if jsonb_typeof(p_op -> 'doc') is distinct from 'object' or jsonb_typeof(p_op -> 'expected_revision') is distinct from 'number' then
+      return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'invalid replace_state'));
+    end if;
+    if (p_op ->> 'expected_revision')::bigint <> p_start_revision then
+      return jsonb_build_object('status', 'conflict', 'detail', jsonb_build_object(
+        'current_revision', p_start_revision, 'expected_revision', (p_op ->> 'expected_revision')::bigint));
+    end if;
+    v_before := null;
+    if coalesce((p_op ->> 'subtract_meals_since')::boolean, false) then
+      v_before := dog_log._try_ts(p_op ->> 'backup_created_at');
+      if v_before is null then
+        return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'backup_created_at required'));
+      end if;
+    end if;
+    v_snapshot := case when p_op ->> 'reason' = 'restore-backup' then 'pre-restore' else 'pre-replace' end;
+    insert into dog_log.state_snapshots (owner_id, reason, revision, doc) values (p_owner, v_snapshot, r.revision, r.doc);
+    -- The server meal cursor and meal_events are kept; the backup's own tracking is ignored (R8).
+    v_doc := dog_log._norm_doc(p_op -> 'doc');
+    v_n := 0;
+    v_transferred := 0;
+    if v_before is not null then
+      for v_event in
+        select outcome, freezer_to_fridge_count
+          from dog_log.meal_events
+         where owner_id = p_owner and slot_at > v_before
+         order by slot_at
+      loop
+        if v_event.outcome = 'fed' then
+          v_cur := (v_doc #>> '{stock,fridge}')::numeric;
+          if v_cur > 0 then
+            v_doc := jsonb_set(v_doc, '{stock,fridge}', to_jsonb(v_cur - 1));
+          else
+            v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(greatest((v_doc #>> '{stock,freezer}')::numeric - 1, 0)));
+          end if;
+          v_n := v_n + 1;
+        end if;
+        if v_event.freezer_to_fridge_count is not null then
+          v_cur := (v_doc #>> '{stock,freezer}')::numeric;
+          v_move := least(v_cur, v_event.freezer_to_fridge_count);
+          if v_move > 0 then
+            v_doc := jsonb_set(v_doc, '{stock,freezer}', to_jsonb(v_cur - v_move));
+            v_doc := jsonb_set(v_doc, '{stock,fridge}',
+              to_jsonb((v_doc #>> '{stock,fridge}')::numeric + v_move));
+            v_transferred := v_transferred + v_move;
+          end if;
+        end if;
+      end loop;
+    end if;
+    v_detail := jsonb_build_object('snapshot', v_snapshot, 'meals_subtracted', v_n,
+                                   'containers_transferred', v_transferred);
+
+  else
+    return jsonb_build_object('status', 'rejected', 'detail', jsonb_build_object('reason', 'unknown operation type'));
+  end if;
+
+  if v_label is not null then
+    v_doc := dog_log._history_push(v_doc, p_cc, v_label);
+  end if;
+  update dog_log.state set doc = v_doc where owner_id = p_owner;
+  return jsonb_build_object('status', v_status, 'detail', v_detail);
+end $$;
+
+-- Base _state_json (20260924225253).
+create or replace function dog_log._state_json(p_owner uuid)
+returns jsonb language sql stable set search_path = pg_catalog, pg_temp as $$
+  select jsonb_build_object(
+    'revision', s.revision,
+    'schema_version', s.schema_version,
+    'min_client_version', s.min_client_version,
+    'time_zone', s.time_zone,
+    'doc', s.doc,
+    'meal_cursor', s.meal_cursor,
+    'meal_tracking_since', s.meal_tracking_since,
+    'recent_meals', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'meal_date', m.meal_date, 'slot', m.slot, 'outcome', m.outcome,
+               'source_container', m.source_container, 'slot_at', m.slot_at,
+               'processed_at', m.processed_at, 'processed_by_device', m.processed_by_device, 'origin', m.origin)
+             order by m.slot_at)
+        from dog_log.meal_events m
+       where m.owner_id = s.owner_id
+         and m.meal_date >= (now() at time zone s.time_zone)::date - 13), '[]'::jsonb),
+    'server_now', now())
+  from dog_log.state s
+  where s.owner_id = p_owner
+$$;
+
+-- Base seed_state (20260924225253).
+-- Section 6/10: first-device seed. Creates the cloud state only if none exists.
+create or replace function dog_log.seed_state(p_seed_id uuid, p_doc jsonb, p_device_id text default null, p_client_version integer default 1)
+returns jsonb language plpgsql volatile security definer
+set search_path = pg_catalog, pg_temp set lock_timeout = '3s' as $$
+declare
+  v_owner    uuid := (select auth.uid());
+  v_device   text := left(p_device_id, 100);
+  v_doc      jsonb;
+  v_ms       numeric;
+  v_cursor   timestamptz;
+  v_since    timestamptz;
+  v_existing uuid;
+  v_inserted int;
+  v_day      text;
+  v_meals    jsonb;
+  v_slot     text;
+  v_status   text;
+begin
+  if v_owner is null then
+    raise exception 'not_authenticated' using errcode = '42501';
+  end if;
+  if coalesce(p_client_version, 0) < 1 then
+    raise exception 'client_outdated' using errcode = '22023', hint = 'min_client_version=1';
+  end if;
+  if p_seed_id is null or p_doc is null or jsonb_typeof(p_doc) <> 'object' then
+    raise exception 'invalid_seed' using errcode = '22023';
+  end if;
+
+  v_doc := dog_log._norm_doc(p_doc);
+  v_ms := case when jsonb_typeof(p_doc #> '{tracking,mealCursor}') = 'number' then (p_doc #>> '{tracking,mealCursor}')::numeric end;
+  v_cursor := case when v_ms is not null and v_ms between -8.64e15 and 8.64e15
+                   then greatest(least(now(), to_timestamp(v_ms / 1000.0)), now() - interval '400 days') end;
+  v_since := case when v_cursor is not null then coalesce(dog_log._try_ts(p_doc #>> '{tracking,mealTrackingSince}'), v_cursor) end;
+
+  insert into dog_log.state (owner_id, doc, seed_id, seeded_from_device, meal_cursor, meal_tracking_since, updated_by_device)
+  values (v_owner, v_doc, p_seed_id, v_device, v_cursor, v_since, v_device)
+  on conflict (owner_id) do nothing;
+  get diagnostics v_inserted = row_count;
+
+  if v_inserted = 0 then
+    -- Nothing is overwritten: a retry of this seed, or another device's cloud copy.
+    select seed_id into v_existing from dog_log.state where owner_id = v_owner;
+    v_status := case when v_existing = p_seed_id then 'already-seeded' else 'cloud-exists' end;
+    return jsonb_build_object('status', v_status) || jsonb_build_object('state', dog_log._state_json(v_owner));
+  end if;
+
+  if v_cursor is not null then
+    -- Import the device's recent meal log so those slots can never be deducted again.
+    v_meals := case when jsonb_typeof(p_doc #> '{tracking,mealLog}') = 'object' then p_doc #> '{tracking,mealLog}' else '{}'::jsonb end;
+    for v_day in select k from jsonb_object_keys(v_meals) k where k ~ '^\d{4}-\d{2}-\d{2}$' loop
+      continue when dog_log._try_ts(v_day) is null;
+      continue when v_day::date < (now() at time zone 'Australia/Melbourne')::date - 13;
+      continue when jsonb_typeof(v_meals -> v_day) is distinct from 'object';
+      foreach v_slot in array array['breakfast', 'dinner'] loop
+        if (v_meals -> v_day ->> v_slot) in ('fed', 'no-stock', 'before-tracking')
+           and dog_log._slot_at(v_day::date, v_slot, 'Australia/Melbourne') <= v_cursor then
+          insert into dog_log.meal_events (owner_id, meal_date, slot, outcome, slot_at, processed_by_device, state_revision, origin)
+          values (v_owner, v_day::date, v_slot, v_meals -> v_day ->> v_slot,
+                  dog_log._slot_at(v_day::date, v_slot, 'Australia/Melbourne'), v_device, 1, 'seed')
+          on conflict do nothing;
+        end if;
+      end loop;
+    end loop;
+  else
+    -- Device never started meal tracking: initialise exactly as WORK-135's first run.
+    perform dog_log._process_due_meals(v_owner, now(), v_device);
+  end if;
+
+  insert into dog_log.state_snapshots (owner_id, reason, revision, doc)
+  select owner_id, 'seed', revision, doc from dog_log.state where owner_id = v_owner;
+
+  return jsonb_build_object('status', 'seeded', 'state', dog_log._state_json(v_owner));
+end $$;
+
+drop function if exists dog_log._sched_time(jsonb, text);
+drop function if exists dog_log._setting(jsonb, text);
+
+comment on table dog_log.meal_events is 'Exactly-once scheduled meals: one row per owner + Australia/Melbourne meal date + slot (primary key).';
+revoke all on function
+  dog_log._norm_doc(jsonb), dog_log._process_due_meals(uuid, timestamptz, text),
+  dog_log._apply_op(uuid, jsonb, timestamptz, bigint), dog_log._state_json(uuid),
+  dog_log.seed_state(uuid, jsonb, text, integer)
+  from public, anon, authenticated, service_role;
+grant execute on function dog_log.seed_state(uuid, jsonb, text, integer) to authenticated;
+comment on function dog_log._process_due_meals(uuid,timestamptz,text) is
+  'Internal exactly-once meal processor; after Dinner, moves up to 2 remaining Full Containers Freezer to Fridge (WORK-147).';
+notify pgrst, 'reload schema';

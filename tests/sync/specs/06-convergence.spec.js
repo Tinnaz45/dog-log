@@ -59,10 +59,13 @@ test('21 scheduled meals are processed once by the server and every device shows
   await expect.poll(async () => backend.count('meal_events', a.owner)).toBeGreaterThanOrEqual(3);
   await waitSynced(a.page);
   const events = (await backend.pool.query("select slot, outcome, source_container, processed_by_device from dog_log.meal_events where owner_id = $1 and origin = 'server' order by slot_at", [a.owner])).rows;
-  const fed = events.filter(e => e.outcome === 'fed').length;
-  expect(events.length).toBeGreaterThanOrEqual(3);
-  expect(events.length).toBeLessThanOrEqual(5);
-  expect(events.map(e => e.source_container).filter(Boolean)).toEqual(events.filter(e => e.outcome === 'fed').map((e, i) => (i < 3 ? 'fridge' : 'freezer')));
+  const meals = events.filter(e => e.slot !== 'transfer');
+  const transfers = events.filter(e => e.slot === 'transfer');
+  const fed = meals.filter(e => e.outcome === 'fed').length;
+  expect(meals.length).toBeGreaterThanOrEqual(3);
+  expect(meals.length).toBeLessThanOrEqual(5);
+  expect(transfers.length).toBeGreaterThanOrEqual(1);
+  expect(meals.map(e => e.source_container).filter(Boolean)).toEqual(meals.filter(e => e.outcome === 'fed').map((e, i) => (i < 3 ? 'fridge' : 'freezer')));
   const row = await backend.state(a.owner);
   expect(row.doc.stock.fridge + row.doc.stock.freezer).toBe(5 - fed);
   await expect(a.page.locator('#fridgeVal')).toHaveValue(String(row.doc.stock.fridge));
@@ -84,10 +87,10 @@ test('21b offline, due meals are projected on screen but never written or deduct
   const a = await seededDevice({ device, backend }, local);
   // Pretend the server cursor is 24h old in this device's cache while offline: exactly two slots are due.
   await setOffline(a, true);
-  const view = await g(a.page, () => { cache.meal_cursor = new Date(Date.now() - 24 * 3600 * 1000).toISOString(); saveCache(); refreshView(); return [state.stock.fridge, projectedSlots.length, JSON.parse(localStorage.getItem('dog_food_stock_v2')).stock.fridge]; });
-  expect(view[1]).toBe(2);
-  expect(view[0]).toBe(5 - 2);  // projected on screen
-  expect(view[2]).toBe(5);      // never written to the mirror
+  const view = await g(a.page, () => { cache.meal_cursor = new Date(Date.now() - 24 * 3600 * 1000).toISOString(); saveCache(); refreshView(); const persisted=JSON.parse(localStorage.getItem('dog_food_stock_v2')).stock; return [state.stock.fridge + state.stock.freezer, projectedSlots.length, persisted.fridge + persisted.freezer]; });
+  expect(view[1]).toBe(3);       // Breakfast + Dinner + independent daily transfer
+  expect(view[0]).toBe(17 - 2); // only the two meals reduce total Full Containers
+  expect(view[2]).toBe(17);     // projection is never written to the mirror
   expect(await backend.count('meal_events', a.owner)).toBe(0);
 });
 

@@ -1,5 +1,8 @@
-// Service worker dog-log-v9: API traffic is never cached; v8 -> v9 keeps local data and the offline shell.
+// Service worker (current CACHE name read from sw.js): API traffic is never cached; v8 -> current keeps local data and the offline shell.
+const fs = require('fs');
+const path = require('path');
 const { test, expect, g, APP, fixture, signIn, waitSynced, raw, EMAIL, PASSWORD } = require('../lib/helpers');
+const CURRENT = fs.readFileSync(path.join(__dirname, '../../../sw.js'), 'utf8').match(/const CACHE = '([^']+)'/)[1];
 
 async function controlled(page) {
   await page.evaluate(() => navigator.serviceWorker.ready);
@@ -30,7 +33,7 @@ test('25 the service worker never caches or answers Supabase, Auth, RPC or Apps 
   expect(api.filter(r => r.sw)).toEqual([]);
   expect(api.some(r => r.url.includes('/auth/v1/token'))).toBe(true);
   const { keys, urls } = await cacheState(page);
-  expect(keys).toEqual(['dog-log-v9']);
+  expect(keys).toEqual([CURRENT]);
   expect(urls.every(u => u.startsWith(APP()))).toBe(true);
   expect(urls.some(u => /supabase\.co|script\.google/.test(u))).toBe(false);
   expect(urls).toEqual(expect.arrayContaining([`${APP()}/vendor/supabase-js-2.116.0.min.js`, `${APP()}/index.html`]));
@@ -46,7 +49,7 @@ test('26 upgrading from the v8 service worker keeps localStorage and the offline
     const storageBefore = await page.evaluate(() => JSON.stringify(Object.entries(localStorage).sort()));
     await fetch(`${APP()}/__test__/sw?version=v9`);
     await page.evaluate(async () => (await navigator.serviceWorker.getRegistration()).update());
-    await expect.poll(async () => (await cacheState(page)).keys, { timeout: 15000 }).toEqual(['dog-log-v9']);
+    await expect.poll(async () => (await cacheState(page)).keys, { timeout: 15000 }).toEqual([CURRENT]);
     await page.reload();
     expect(await page.evaluate(() => JSON.stringify(Object.entries(localStorage).sort()))).toBe(storageBefore);
     expect(await raw(page)).toBe(rawIn);
